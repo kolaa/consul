@@ -15,8 +15,12 @@ func (c *Client) initEnterprise(_ Deps) error {
 	return nil
 }
 
-func enterpriseModifyClientSerfConfigLAN(_ *Config, _ *serf.Config) {
-	// nothing
+func enterpriseModifyClientSerfConfigLAN(_ *Config, serf *serf.Config) {
+
+	if segment := serf.Tags["segment"]; segment != "" {
+		serf.MemberlistConfig.Conflict = nil
+	}
+
 }
 
 func (c *Client) startEnterprise() error {

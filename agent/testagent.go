@@ -444,11 +444,11 @@ func firstAddr(s *apiServers, protocol string) (net.Addr, error) {
 	return nil, fmt.Errorf("no server registered with protocol %v", protocol)
 }
 
-func (a *TestAgent) SegmentAddr(name string) string {
+func (a *TestAgent) SegmentAddr(name string) (string, error) {
 	if server, ok := a.delegate.(*consul.Server); ok {
 		return server.LANSegmentAddr(name)
 	}
-	return ""
+	return "", nil
 }
 
 func (a *TestAgent) Client() *api.Client {

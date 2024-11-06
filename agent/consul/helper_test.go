@@ -156,7 +156,11 @@ func joinLANWithOptions(t *testing.T, member clientOrServer, leader *Server, doM
 
 	leaderAddr := joinAddrLAN(leader)
 	if memberSegment != "" {
-		leaderAddr = leader.LANSegmentAddr(memberSegment)
+		var err error
+		leaderAddr, err = leader.LANSegmentAddr(memberSegment)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := member.JoinLAN([]string{leaderAddr}, memberEntMeta); err != nil {
 		t.Fatal(err)
