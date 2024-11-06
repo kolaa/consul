@@ -22,15 +22,15 @@ func validateEnterpriseConfigKeys(config *Config) []error {
 	if config.ReadReplica != nil {
 		add(`read_replica (or the deprecated non_voting_server)`)
 	}
-	if stringVal(config.SegmentName) != "" {
-		add("segment")
-	}
-	if len(config.Segments) > 0 {
-		add("segments")
-	}
-	if stringVal(config.Partition) != "" {
-		add("partition")
-	}
+	// if stringVal(config.SegmentName) != "" {
+	// 	add("segment")
+	// }
+	// if len(config.Segments) > 0 {
+	// 	add("segments")
+	// }
+	// if stringVal(config.Partition) != "" {
+	// 	add("partition")
+	// }
 	if stringVal(config.Autopilot.RedundancyZoneTag) != "" {
 		add("autopilot.redundancy_zone_tag")
 	}
