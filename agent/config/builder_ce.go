@@ -7,6 +7,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"strings"
 )
 
 // validateEnterpriseConfig is a function to validate the enterprise specific
@@ -22,12 +24,12 @@ func validateEnterpriseConfigKeys(config *Config) []error {
 	if config.ReadReplica != nil {
 		add(`read_replica (or the deprecated non_voting_server)`)
 	}
-	if stringVal(config.SegmentName) != "" {
-		add("segment")
-	}
-	if len(config.Segments) > 0 {
-		add("segments")
-	}
+	// if stringVal(config.SegmentName) != "" {
+	// 	add("segment")
+	// }
+	// if len(config.Segments) > 0 {
+	// 	add("segments")
+	// }
 	if stringVal(config.Partition) != "" {
 		add("partition")
 	}
@@ -79,6 +81,38 @@ func (*builder) BuildEnterpriseRuntimeConfig(_ *RuntimeConfig, _ *Config) error 
 	return nil
 }
 
-func (*builder) validateEnterpriseConfig(_ RuntimeConfig) error {
+// defaultSerfLANPort is the default port of the LAN gossip pool
+// (ports.serf_lan), where memberlist resolves retry_join addresses that carry
+// no explicit port.
+const defaultSerfLANPort = 8301
+
+func (*builder) validateEnterpriseConfig(rt RuntimeConfig) error {
+	if rt.ServerMode || rt.SegmentName == "" {
+		return nil
+	}
+	// Documented pattern: ports.serf_lan = <segment port> + bare retry_join.
+	// memberlist then resolves the port-less address against the overridden
+	// serf_lan port, which is the segment's port, so the join lands in the
+	// right pool.
+	if rt.SerfPortLAN != defaultSerfLANPort {
+		return nil
+	}
+	// A client in a network segment gossips only with that segment's serf pool
+	// on the servers. With the default serf_lan port, memberlist resolves a
+	// retry_join address that carries no explicit port against the default LAN
+	// pool instead, so the join is rejected as a wrong-segment merge. Only
+	// flag literal addresses here; cloud auto-join (provider=...) results are
+	// resolved at join time.
+	for _, addr := range rt.RetryJoinLAN {
+		if strings.Contains(addr, "provider=") {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return fmt.Errorf("retry_join %q has no port while segment = %q and ports.serf_lan "+
+				"is the default %d: use host:<segment port> or set ports.serf_lan to the segment port",
+				addr, rt.SegmentName, defaultSerfLANPort)
+		}
+	}
+
 	return nil
 }

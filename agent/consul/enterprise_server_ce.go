@@ -8,8 +8,13 @@ package consul
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/serf/serf"
@@ -25,9 +30,16 @@ var (
 	minMultiDCConnectVersion = version.Must(version.NewVersion("1.6.0"))
 )
 
-type EnterpriseServer struct{}
+type EnterpriseServer struct {
+	segmentLan       map[string]*serf.Serf
+	segmentListeners map[string]net.Listener
+}
 
 func (s *Server) initEnterprise(_ Deps) error {
+
+	s.segmentLan = make(map[string]*serf.Serf, len(s.config.Segments))
+	s.segmentListeners = make(map[string]net.Listener, len(s.config.Segments))
+
 	return nil
 }
 
@@ -47,7 +59,21 @@ func (s *Server) handleEnterpriseNativeTLSConn(alpnProto string, conn net.Conn) 
 	return false
 }
 
-func (s *Server) handleEnterpriseLeave() {}
+func (s *Server) handleEnterpriseLeave() {
+	// serf.Leave blocks for roughly BroadcastTimeout + LeavePropagateDelay;
+	// leaving N pools sequentially can blow through systemd TimeoutStopSec or
+	// a Kubernetes terminationGracePeriodSeconds, so leave them in parallel.
+	var wg sync.WaitGroup
+	for _, name := range s.segmentNames() {
+		pool := s.segmentLan[name]
+		wg.Go(func() {
+			if err := pool.Leave(); err != nil {
+				s.logger.Error("failed to leave segment LAN pool", "segment", name, "error", err)
+			}
+		})
+	}
+	wg.Wait()
+}
 
 func (s *Server) establishEnterpriseLeadership(_ context.Context) error {
 	return nil
@@ -91,9 +117,22 @@ func (s *Server) validateEnterpriseIntentionNamespace(ns string, _ bool) error {
 	return errors.New("Namespaces is a Consul Enterprise feature")
 }
 
+// LANSegments returns a map of LAN segments by name
+func (s *Server) LANSegments() map[string]*serf.Serf {
+	return s.segmentLan
+}
+
+// segmentNames returns the segment pool names in sorted order. Map iteration
+// order is random, so keyring responses, coordinate sets and logs would come
+// out in a different order on every call without it.
+func (s *Server) segmentNames() []string {
+	return slices.Sorted(maps.Keys(s.segmentLan))
+}
+
 // setupSerfLAN is used to setup and initialize a Serf for the LAN
 func (s *Server) setupSerfLAN(config *Config) error {
 	var err error
+
 	// Initialize the LAN Serf for the default network segment.
 	s.serfLAN, _, err = s.setupSerf(setupSerfOptions{
 		Config:       config.SerfLANConfig,
@@ -113,6 +152,21 @@ func (s *Server) setupSerfLAN(config *Config) error {
 func (s *Server) shutdownSerfLAN() {
 	if s.serfLAN != nil {
 		s.serfLAN.Shutdown()
+	}
+	// Segment pools and their RPC listeners must go down too, otherwise an
+	// in-process restart or a test cleanup hits "address already in use".
+	for _, name := range s.segmentNames() {
+		s.segmentLan[name].Shutdown()
+	}
+	for _, ln := range s.segmentListeners {
+		_ = ln.Close()
+	}
+}
+
+func (s *Server) OverrideInitialSerfTags(tags map[string]string) {
+
+	for _, segment := range s.config.Segments {
+		tags[fmt.Sprint("sl_", segment.Name)] = net.JoinHostPort(segment.Bind, strconv.Itoa(segment.Port))
 	}
 }
 

@@ -29,18 +29,18 @@ func TestValidateEnterpriseConfigKeys(t *testing.T) {
 			},
 			badKeys: []string{"read_replica (or the deprecated non_voting_server)"},
 		},
-		"segment": {
-			config: Config{
-				SegmentName: &stringVal,
-			},
-			badKeys: []string{"segment"},
-		},
-		"segments": {
-			config: Config{
-				Segments: []Segment{{Name: &stringVal}},
-			},
-			badKeys: []string{"segments"},
-		},
+		// "segment": {
+		// 	config: Config{
+		// 		SegmentName: &stringVal,
+		// 	},
+		// 	badKeys: []string{"segment"},
+		// },
+		// "segments": {
+		// 	config: Config{
+		// 		Segments: []Segment{{Name: &stringVal}},
+		// 	},
+		// 	badKeys: []string{"segments"},
+		// },
 		"autopilot.redundancy_zone_tag": {
 			config: Config{
 				Autopilot: Autopilot{
@@ -132,7 +132,7 @@ func TestValidateEnterpriseConfigKeys(t *testing.T) {
 					},
 				},
 			},
-			badKeys: []string{"read_replica (or the deprecated non_voting_server)", "segment"},
+			badKeys: []string{"read_replica (or the deprecated non_voting_server)"},
 		},
 	}
 
@@ -153,6 +153,76 @@ func TestValidateEnterpriseConfigKeys(t *testing.T) {
 			if tcase.check != nil {
 				tcase.check(t, &tcase.config)
 			}
+		})
+	}
+}
+
+// The documented Enterprise network-segment client pattern is
+// `segment = "alpha"` + `ports.serf_lan = 8303` + a bare retry_join entry:
+// memberlist then resolves the port-less address against the overridden
+// serf_lan port, so the join lands in the right segment pool. The bare
+// address must only be rejected while ports.serf_lan is still the default.
+func TestValidateEnterpriseConfig_SegmentClientRetryJoin(t *testing.T) {
+	t.Parallel()
+
+	b := &builder{}
+
+	cases := map[string]struct {
+		rt      RuntimeConfig
+		wantErr string
+	}{
+		"documented pattern: ports.serf_lan overridden, bare retry_join": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8303,
+				RetryJoinLAN: []string{"10.0.0.5"},
+			},
+		},
+		"bare retry_join with the default serf_lan port is rejected": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"10.0.0.5"},
+			},
+			wantErr: "has no port",
+		},
+		"retry_join with an explicit port is accepted": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"10.0.0.5:8303"},
+			},
+		},
+		"cloud auto-join results are not validated": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"provider=aws tag_key=consul segment=alpha"},
+			},
+		},
+		"servers are not validated": {
+			rt: RuntimeConfig{
+				ServerMode:   true,
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"10.0.0.5"},
+			},
+		},
+		"clients without a segment are not validated": {
+			rt: RuntimeConfig{
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"10.0.0.5"},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := b.validateEnterpriseConfig(tc.rt)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
 }
