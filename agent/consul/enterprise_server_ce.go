@@ -8,7 +8,9 @@ package consul
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/go-version"
@@ -25,9 +27,16 @@ var (
 	minMultiDCConnectVersion = version.Must(version.NewVersion("1.6.0"))
 )
 
-type EnterpriseServer struct{}
+type EnterpriseServer struct {
+	segmentLan map[string]*serf.Serf
+}
 
 func (s *Server) initEnterprise(_ Deps) error {
+
+	s.segmentLan = make(map[string]*serf.Serf, len(s.config.Segments))
+
+	s.config.OverrideInitialSerfTags = s.OverrideInitialSerfTags
+
 	return nil
 }
 
@@ -93,9 +102,15 @@ func (s *Server) validateEnterpriseIntentionNamespace(ns string, _ bool) error {
 	return errors.New("Namespaces is a Consul Enterprise feature")
 }
 
+// LANSegments returns a map of LAN segments by name
+func (s *Server) LANSegments() map[string]*serf.Serf {
+	return s.segmentLan
+}
+
 // setupSerfLAN is used to setup and initialize a Serf for the LAN
 func (s *Server) setupSerfLAN(config *Config) error {
 	var err error
+
 	// Initialize the LAN Serf for the default network segment.
 	s.serfLAN, _, err = s.setupSerf(setupSerfOptions{
 		Config:       config.SerfLANConfig,
@@ -115,6 +130,13 @@ func (s *Server) setupSerfLAN(config *Config) error {
 func (s *Server) shutdownSerfLAN() {
 	if s.serfLAN != nil {
 		s.serfLAN.Shutdown()
+	}
+}
+
+func (s *Server) OverrideInitialSerfTags(tags map[string]string) {
+
+	for _, segment := range s.config.Segments {
+		tags[fmt.Sprint("sl_", segment.Name)] = net.JoinHostPort(segment.Bind, strconv.Itoa(segment.Port))
 	}
 }
 

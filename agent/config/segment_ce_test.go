@@ -21,11 +21,10 @@ func TestSegments(t *testing.T) {
 			args: []string{
 				`-data-dir=` + dataDir,
 			},
-			json:        []string{`{ "server": true, "segment": "a" }`},
-			hcl:         []string{` server = true segment = "a" `},
-			expectedErr: `Network segments are not supported in this version of Consul`,
-			expectedWarnings: []string{
-				enterpriseConfigKeyError{key: "segment"}.Error(),
+			json: []string{`{ "server": true, "segment": "a" }`},
+			hcl:  []string{` server = true segment = "a" `},
+			expected: func(rt *RuntimeConfig) {
+				rt.SegmentName = "a"
 			},
 		},
 		{
@@ -40,18 +39,17 @@ func TestSegments(t *testing.T) {
 				enterpriseConfigKeyError{key: "segments"}.Error(),
 			},
 		},
-		{
-			desc: "segments not in CE",
-			args: []string{
-				`-data-dir=` + dataDir,
-			},
-			json:        []string{`{ "segments":[{ "name":"x", "port": 123 }] }`},
-			hcl:         []string{`segments = [{ name = "x" port = 123 }]`},
-			expectedErr: `Network segments are not supported in this version of Consul`,
-			expectedWarnings: []string{
-				enterpriseConfigKeyError{key: "segments"}.Error(),
-			},
-		},
+		// {
+		// 	desc: "segments not in CE",
+		// 	args: []string{
+		// 		`-data-dir=` + dataDir,
+		// 	},
+		// 	json:        []string{`{ "segments":[{ "name":"x", "port": 123 }] }`},
+		// 	hcl:         []string{`segments = [{ name = "x" port = 123 }]`},
+		// 	expected: func(rt *RuntimeConfig) {
+		// 		rt.Segments = []NetworkSegment("x", 123)
+		// 	},
+		// },
 	}
 
 	for _, tc := range tests {

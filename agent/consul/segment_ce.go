@@ -6,11 +6,12 @@
 package consul
 
 import (
+	"fmt"
+	"github.com/hashicorp/consul/agent/metadata"
 	"net"
+	"strings"
 
 	"github.com/armon/go-metrics/prometheus"
-
-	"github.com/hashicorp/consul/agent/structs"
 )
 
 var SegmentCESummaries = []prometheus.SummaryDefinition{
@@ -22,24 +23,54 @@ var SegmentCESummaries = []prometheus.SummaryDefinition{
 
 // LANSegmentAddr is used to return the address used for the given LAN segment.
 func (s *Server) LANSegmentAddr(name string) string {
-	return ""
+	return s.LANSegments()[name].LocalMember().Addr.String()
 }
 
-// setupSegmentRPC returns an error if any segments are defined since the CE
-// version of Consul doesn't support them.
+// setupSegmentRPC
 func (s *Server) setupSegmentRPC() (map[string]net.Listener, error) {
-	if len(s.config.Segments) > 0 {
-		return nil, structs.ErrSegmentsNotSupported
+	listeners := map[string]net.Listener{}
+
+	for _, segment := range s.config.Segments {
+
+		if segment.RPCAddr != nil {
+			ln, err := net.ListenTCP("tcp", segment.RPCAddr)
+			if err != nil {
+				return nil, err
+			}
+			listeners[segment.Name] = ln
+		}
 	}
 
-	return nil, nil
+	return listeners, nil
 }
 
 // setupSegments returns an error if any segments are defined since the CE
 // version of Consul doesn't support them.
 func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Listener) error {
-	if len(config.Segments) > 0 {
-		return structs.ErrSegmentsNotSupported
+
+	for _, segment := range config.Segments {
+
+		listener := rpcListeners[segment.Name]
+
+		if listener == nil {
+			listener = s.Listener
+		}
+
+		ln, _, err := s.setupSerf(setupSerfOptions{
+			Config:       segment.SerfConfig,
+			EventCh:      s.eventChLAN,
+			SnapshotPath: fmt.Sprintf("serf/%s.snapshot", strings.ToLower(segment.Name)),
+			Listener:     listener,
+			WAN:          false,
+			Segment:      segment.Name,
+			Partition:    "",
+		})
+
+		if err != nil {
+			return fmt.Errorf("Failed to start LAN Serf: %v for segment %s", err, segment.Name)
+		}
+
+		s.segmentLan[segment.Name] = ln
 	}
 
 	return nil
@@ -47,4 +78,17 @@ func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Liste
 
 // floodSegments is a NOP in the CE version of Consul.
 func (s *Server) floodSegments(config *Config) {
+
+	for _, sc := range config.Segments {
+		//Fire up the join flooder.
+		addrFn := func(s *metadata.Server) (string, error) {
+
+			addr := s.SegmentAddrs[sc.Name]
+			port := s.SegmentPorts[sc.Name]
+
+			return fmt.Sprintf("%s:%d", addr, port), nil
+		}
+
+		go s.Flood(addrFn, s.segmentLan[sc.Name])
+	}
 }
