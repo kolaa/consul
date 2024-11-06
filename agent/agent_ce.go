@@ -9,6 +9,9 @@ import (
 	"context"
 	"fmt"
 
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/serf/serf"
+
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/consul"
@@ -26,18 +29,86 @@ func fillAgentServiceEnterpriseMeta(_ *api.AgentService, _ *acl.EnterpriseMeta) 
 // fillHealthCheckEnterpriseMeta is a noop stub for the func defined agent_ent.go
 func fillHealthCheckEnterpriseMeta(_ *api.HealthCheck, _ *acl.EnterpriseMeta) {}
 
-// initEnterprise is a noop stub for the func defined agent_ent.go
+// initEnterprise is the community edition counterpart of the func defined in
+// agent_ent.go.
+//
+// It runs in Agent.Start after agent.go installs UserEventHandler and before
+// the server or client is created, which is where the community edition can
+// adjust agent state that agent.go declares no field for. Here the handler is
+// wrapped to drop repeated deliveries of a fanned-out user event: a server
+// belongs to the default LAN pool plus every segment pool, and
+// LANSendUserEvent broadcasts the same payload bytes to all of them over one
+// shared channel, so without dedup the event would be ingested once per pool.
+// Keying on the payload bytes is enough — every pool carries the identical
+// []byte — and spares a second msgpack decode. The window grows with the pool
+// count, so a burst of events across N+1 pools cannot evict an event's first
+// copy before its last one arrives.
 func (a *Agent) initEnterprise(consulCfg *consul.Config) error {
+	if consulCfg.UserEventHandler == nil {
+		return nil
+	}
+	seen, err := lru.New(userEventDedupPerPool * (1 + len(consulCfg.Segments)))
+	if err != nil {
+		return fmt.Errorf("failed to create user event dedup: %w", err)
+	}
+	inner := consulCfg.UserEventHandler
+	consulCfg.UserEventHandler = func(e serf.UserEvent) {
+		if len(e.Payload) > 0 {
+			if dup, _ := seen.ContainsOrAdd(string(e.Payload), struct{}{}); dup {
+				return
+			}
+		}
+		inner(e)
+	}
 	return nil
 }
+
+// userEventDedupPerPool is how many recent user events the dedup remembers
+// for each LAN pool the agent belongs to.
+const userEventDedupPerPool = 256
 
 // reloadEnterprise is a noop stub for the func defined agent_ent.go
 func (a *Agent) reloadEnterprise(conf *config.RuntimeConfig) error {
 	return nil
 }
 
-// enterpriseConsulConfig is a noop stub for the func defined in agent_ent.go
-func enterpriseConsulConfig(_ *consul.Config, _ *config.RuntimeConfig) {
+// enterpriseConsulConfig applies the community edition adjustments to the
+// consul config at the end of newConsulConfig.
+//
+// agent.segmentConfig() builds segment pools from library defaults plus a few
+// LAN settings (CIDRs, reconnect timeout, verify flags), because agent.go has
+// no enterprise hook at the point where it runs. Now that
+// newConsulConfig has applied every gossip_lan.* tuning knob to
+// cfg.SerfLANConfig and setupKeyrings has handed each segment its own keyring,
+// re-clone each segment pool from the final LAN config so the tuned settings
+// (intervals, probes, CIDRs, verify flags, reconnect timeout) reach every
+// segment, not just the default pool.
+func enterpriseConsulConfig(cfg *consul.Config, _ *config.RuntimeConfig) {
+	if cfg.SerfLANConfig == nil {
+		return
+	}
+
+	for i := range cfg.Segments {
+		segment := &cfg.Segments[i]
+		if segment.SerfConfig == nil {
+			continue
+		}
+
+		// Only the segment specific values survive from the config that
+		// segmentConfig built: the bind/advertise addresses it was given, the
+		// keyring copy setupKeyrings created for it (pools must not share one
+		// keyring object) and the fact that segments have no keyring file.
+		previous := segment.SerfConfig
+		serfConf := consul.CloneSerfLANConfig(cfg.SerfLANConfig)
+		serfConf.MemberlistConfig.BindAddr = previous.MemberlistConfig.BindAddr
+		serfConf.MemberlistConfig.BindPort = previous.MemberlistConfig.BindPort
+		serfConf.MemberlistConfig.AdvertiseAddr = previous.MemberlistConfig.AdvertiseAddr
+		serfConf.MemberlistConfig.AdvertisePort = previous.MemberlistConfig.AdvertisePort
+		serfConf.MemberlistConfig.Keyring = previous.MemberlistConfig.Keyring
+		serfConf.KeyringFile = previous.KeyringFile
+
+		segment.SerfConfig = serfConf
+	}
 }
 
 // validateFIPSConfig is a noop stub for the func defined in agent_ent.go
