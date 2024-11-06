@@ -26,7 +26,7 @@ var (
 	Version, VersionPrerelease, _ = strings.Cut(strings.TrimSpace(fullVersion), "-")
 
 	// https://semver.org/#spec-item-10
-	VersionMetadata = ""
+	VersionMetadata = "sg"
 
 	// The date/time of the build (actually the HEAD commit in git, to preserve stability)
 	// This isn't just informational, but is also used by the licensing system. Default is chosen to be flagantly wrong.
