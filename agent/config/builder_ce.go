@@ -7,6 +7,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"strings"
 )
 
 // validateEnterpriseConfig is a function to validate the enterprise specific
@@ -22,15 +24,15 @@ func validateEnterpriseConfigKeys(config *Config) []error {
 	if config.ReadReplica != nil {
 		add(`read_replica (or the deprecated non_voting_server)`)
 	}
-	if stringVal(config.SegmentName) != "" {
-		add("segment")
-	}
-	if len(config.Segments) > 0 {
-		add("segments")
-	}
-	if stringVal(config.Partition) != "" {
-		add("partition")
-	}
+	// if stringVal(config.SegmentName) != "" {
+	// 	add("segment")
+	// }
+	// if len(config.Segments) > 0 {
+	// 	add("segments")
+	// }
+	// if stringVal(config.Partition) != "" {
+	// 	add("partition")
+	// }
 	if stringVal(config.Autopilot.RedundancyZoneTag) != "" {
 		add("autopilot.redundancy_zone_tag")
 	}
@@ -79,6 +81,23 @@ func (*builder) BuildEnterpriseRuntimeConfig(_ *RuntimeConfig, _ *Config) error 
 	return nil
 }
 
-func (*builder) validateEnterpriseConfig(_ RuntimeConfig) error {
+func (*builder) validateEnterpriseConfig(rt RuntimeConfig) error {
+	// A client in a network segment gossip only with that segment's serf pool
+	// on the servers. memberlist resolves a retry_join address that carries no
+	// explicit port against this agent's own serf LAN bind port, which points
+	// at the servers' default LAN pool instead, so the join is rejected as a
+	// wrong-segment merge. Only flag literal addresses here; cloud auto-join
+	// (provider=...) results are resolved at join time.
+	if !rt.ServerMode && rt.SegmentName != "" {
+		for _, addr := range rt.RetryJoinLAN {
+			if strings.Contains(addr, "provider=") {
+				continue
+			}
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				return fmt.Errorf("retry_join address %q has no port, but segment = %q is set: without the segment's serf port the join targets the default LAN pool and will be rejected. Add the port explicitly (host:port)", addr, rt.SegmentName)
+			}
+		}
+	}
+
 	return nil
 }

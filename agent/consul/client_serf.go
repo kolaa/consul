@@ -65,7 +65,7 @@ func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (
 		return nil, err
 	}
 
-	addSerfMetricsLabels(conf, false, c.config.Segment, c.config.AgentEnterpriseMeta().PartitionOrDefault(), "")
+	addSerfMetricsLabels(conf, false, c.config.Segment, c.config.AgentEnterpriseMeta().PartitionOrDefault())
 
 	addEnterpriseSerfTags(conf.Tags, c.config.AgentEnterpriseMeta())
 

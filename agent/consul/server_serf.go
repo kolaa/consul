@@ -240,7 +240,7 @@ func (s *Server) setupSerfConfig(opts setupSerfOptions) (*serf.Config, error) {
 
 	conf.ReconnectTimeoutOverride = libserf.NewReconnectOverride(s.logger)
 
-	addSerfMetricsLabels(conf, opts.WAN, opts.Segment, s.config.AgentEnterpriseMeta().PartitionOrDefault(), "")
+	addSerfMetricsLabels(conf, opts.WAN, opts.Segment, s.config.AgentEnterpriseMeta().PartitionOrDefault())
 
 	addEnterpriseSerfTags(conf.Tags, s.config.AgentEnterpriseMeta())
 
