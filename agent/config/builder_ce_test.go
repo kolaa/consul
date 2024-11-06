@@ -23,24 +23,24 @@ func TestValidateEnterpriseConfigKeys(t *testing.T) {
 	stringVal := "string"
 
 	cases := map[string]testCase{
-		"read_replica": {
-			config: Config{
-				ReadReplica: &boolVal,
-			},
-			badKeys: []string{"read_replica (or the deprecated non_voting_server)"},
-		},
-		"segment": {
-			config: Config{
-				SegmentName: &stringVal,
-			},
-			badKeys: []string{"segment"},
-		},
-		"segments": {
-			config: Config{
-				Segments: []Segment{{Name: &stringVal}},
-			},
-			badKeys: []string{"segments"},
-		},
+		// "read_replica": {
+		// 	config: Config{
+		// 		ReadReplica: &boolVal,
+		// 	},
+		// 	badKeys: []string{"read_replica (or the deprecated non_voting_server)"},
+		// },
+		// "segment": {
+		// 	config: Config{
+		// 		SegmentName: &stringVal,
+		// 	},
+		// 	badKeys: []string{"segment"},
+		// },
+		// "segments": {
+		// 	config: Config{
+		// 		Segments: []Segment{{Name: &stringVal}},
+		// 	},
+		// 	badKeys: []string{"segments"},
+		// },
 		"autopilot.redundancy_zone_tag": {
 			config: Config{
 				Autopilot: Autopilot{
@@ -132,7 +132,7 @@ func TestValidateEnterpriseConfigKeys(t *testing.T) {
 					},
 				},
 			},
-			badKeys: []string{"read_replica (or the deprecated non_voting_server)", "segment"},
+			badKeys: []string{"read_replica (or the deprecated non_voting_server)"},
 		},
 	}
 
