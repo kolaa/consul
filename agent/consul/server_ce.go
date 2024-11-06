@@ -7,6 +7,7 @@ package consul
 
 import (
 	"fmt"
+	"github.com/hashicorp/consul/agent/structs"
 	"strings"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/consul/reporting"
 	resourcegrpc "github.com/hashicorp/consul/agent/grpc-external/services/resource"
-	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/internal/resource"
 	"github.com/hashicorp/consul/logging"
@@ -69,6 +69,14 @@ func (s *Server) removeFailedNode(
 		} else if found {
 			foundAny = true
 		}
+
+		for segment, segmentLan := range s.segmentLan {
+			if found, err := maybeRemove(segmentLan, node); err != nil {
+				merr = multierror.Append(merr, fmt.Errorf("could not remove failed node from segment %s LAN: %w", segment, err))
+			} else if found {
+				foundAny = true
+			}
+		}
 	}
 
 	if s.serfWAN != nil {
@@ -90,10 +98,21 @@ func (s *Server) removeFailedNode(
 	return nil
 }
 
-// lanPoolAllMembers only returns our own segment or partition's members, because
-// CE servers can't be in multiple segments or partitions.
+// lanPoolAllMembers
 func (s *Server) lanPoolAllMembers() ([]serf.Member, error) {
-	return s.LANMembersInAgentPartition(), nil
+
+	members := s.LANMembersInAgentPartition()
+
+	for _, lan := range s.segmentLan {
+		for _, member := range lan.Members() {
+			if member.Tags["role"] == "consul" {
+				continue
+			}
+			members = append(members, member)
+		}
+	}
+
+	return members, nil
 }
 
 // LANMembers returns the LAN members for one of:
@@ -107,17 +126,34 @@ func (s *Server) LANMembers(filter LANMemberFilter) ([]serf.Member, error) {
 	if err := filter.Validate(); err != nil {
 		return nil, err
 	}
+	if filter.AllSegments {
+		return s.lanPoolAllMembers()
+	}
 	if filter.Segment != "" {
-		return nil, structs.ErrSegmentsNotSupported
+		return s.LANSegments()[filter.Segment].Members(), nil
 	}
 	return s.LANMembersInAgentPartition(), nil
 }
 
-func (s *Server) GetMatchingLANCoordinate(_, _ string) (*coordinate.Coordinate, error) {
-	return s.serfLAN.GetCoordinate()
+func (s *Server) GetMatchingLANCoordinate(_, segment string) (*coordinate.Coordinate, error) {
+
+	if segment == "" || s.config.Segment == segment {
+		return s.serfLAN.GetCoordinate()
+	}
+
+	return s.segmentLan[segment].GetCoordinate()
 }
 
 func (s *Server) addEnterpriseLANCoordinates(cs librtt.CoordinateSet) error {
+
+	for name, segment := range s.segmentLan {
+		c, err := segment.GetCoordinate()
+		if err != nil {
+			return err
+		}
+		cs[name] = c
+	}
+
 	return nil
 }
 
@@ -140,6 +176,14 @@ func (s *Server) DoWithLANSerfs(
 	if err != nil {
 		return errorFn("", "", err)
 	}
+
+	for name, segmentSerf := range s.segmentLan {
+		err := fn(name, PoolKindSegment, segmentSerf)
+		if err != nil {
+			return errorFn(name, PoolKindSegment, err)
+		}
+	}
+
 	return nil
 }
 
@@ -153,11 +197,24 @@ func (s *Server) reconcile() (err error) {
 	members := s.serfLAN.Members()
 	knownMembers := make(map[string]struct{})
 	for _, member := range members {
-		memberName := strings.ToLower(member.Name)
 		if err := s.reconcileMember(member); err != nil {
 			return err
 		}
-		knownMembers[memberName] = struct{}{}
+		knownMembers[strings.ToLower(member.Name)] = struct{}{}
+	}
+
+	for _, segment := range s.segmentLan {
+		members = segment.Members()
+
+		for _, member := range members {
+			if err := s.reconcileMember(member); err != nil {
+				return err
+			}
+
+			if _, ok := knownMembers[strings.ToLower(member.Name)]; !ok {
+				knownMembers[strings.ToLower(member.Name)] = struct{}{}
+			}
+		}
 	}
 
 	// Reconcile any members that have been reaped while we were not the
@@ -184,8 +241,14 @@ func addSerfMetricsLabels(conf *serf.Config, wan bool, segment string, partition
 	} else {
 		networkMetric.Value = "lan"
 	}
-
 	conf.MetricLabels = append(conf.MetricLabels, networkMetric)
+
+	segmentMetric := metrics.Label{
+		Name:  "segment",
+		Value: segment,
+	}
+	conf.MetricLabels = append(conf.MetricLabels, segmentMetric)
+
 }
 
 func (s *Server) updateReportingConfig(config ReloadableConfig) {
