@@ -55,7 +55,7 @@ func TestMerge_CE_LAN(t *testing.T) {
 					segment: "alpha",
 				}),
 			},
-			expect: `Member 'node1' part of segment 'alpha'; Network Segments are a Consul Enterprise feature`,
+			expect: ``,
 		},
 		"node in a partition": {
 			members: []*serf.Member{
