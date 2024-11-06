@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/serf/serf"
 )
 
 // enterpriseAgent embeds fields that we only access in consul-enterprise builds
@@ -26,8 +27,30 @@ func fillAgentServiceEnterpriseMeta(_ *api.AgentService, _ *acl.EnterpriseMeta) 
 // fillHealthCheckEnterpriseMeta is a noop stub for the func defined agent_ent.go
 func fillHealthCheckEnterpriseMeta(_ *api.HealthCheck, _ *acl.EnterpriseMeta) {}
 
-// initEnterprise is a noop stub for the func defined agent_ent.go
+// initEnterprise is the community edition counterpart of the func defined in
+// agent_ent.go.
+//
+// It runs in Agent.Start after agent.go installs UserEventHandler and before
+// the server or client is created, which is where the community edition can
+// adjust agent state that agent.go declares no field for. Here the handler is
+// wrapped to drop repeated deliveries of a fanned-out user event: a server
+// belongs to the default LAN pool plus every segment pool, and
+// LANSendUserEvent broadcasts the same payload bytes to all of them over one
+// shared channel, so without dedup the event would be ingested once per pool.
+// Keying on the payload bytes is enough — every pool carries the identical
+// []byte — and spares a second msgpack decode.
 func (a *Agent) initEnterprise(consulCfg *consul.Config) error {
+	if consulCfg.UserEventHandler == nil {
+		return nil
+	}
+	dedup := NewEventDedup(256)
+	inner := consulCfg.UserEventHandler
+	consulCfg.UserEventHandler = func(e serf.UserEvent) {
+		if !dedup.FirstSeen(string(e.Payload)) {
+			return
+		}
+		inner(e)
+	}
 	return nil
 }
 
@@ -36,8 +59,42 @@ func (a *Agent) reloadEnterprise(conf *config.RuntimeConfig) error {
 	return nil
 }
 
-// enterpriseConsulConfig is a noop stub for the func defined in agent_ent.go
-func enterpriseConsulConfig(_ *consul.Config, _ *config.RuntimeConfig) {
+// enterpriseConsulConfig applies the community edition adjustments to the
+// consul config at the end of newConsulConfig.
+//
+// agent.segmentConfig() can only build segment pools from library defaults,
+// because agent.go has no enterprise hook at the point where it runs. Now that
+// newConsulConfig has applied every gossip_lan.* tuning knob to
+// cfg.SerfLANConfig and setupKeyrings has handed each segment its own keyring,
+// re-clone each segment pool from the final LAN config so the tuned settings
+// (intervals, probes, CIDRs, verify flags, reconnect timeout) reach every
+// segment, not just the default pool.
+func enterpriseConsulConfig(cfg *consul.Config, _ *config.RuntimeConfig) {
+	if cfg.SerfLANConfig == nil {
+		return
+	}
+
+	for i := range cfg.Segments {
+		segment := &cfg.Segments[i]
+		if segment.SerfConfig == nil {
+			continue
+		}
+
+		// Only the segment specific values survive from the config that
+		// segmentConfig built: the bind/advertise addresses it was given, the
+		// keyring copy setupKeyrings created for it (pools must not share one
+		// keyring object) and the fact that segments have no keyring file.
+		previous := segment.SerfConfig
+		serfConf := consul.CloneSerfLANConfig(cfg.SerfLANConfig)
+		serfConf.MemberlistConfig.BindAddr = previous.MemberlistConfig.BindAddr
+		serfConf.MemberlistConfig.BindPort = previous.MemberlistConfig.BindPort
+		serfConf.MemberlistConfig.AdvertiseAddr = previous.MemberlistConfig.AdvertiseAddr
+		serfConf.MemberlistConfig.AdvertisePort = previous.MemberlistConfig.AdvertisePort
+		serfConf.MemberlistConfig.Keyring = previous.MemberlistConfig.Keyring
+		serfConf.KeyringFile = previous.KeyringFile
+
+		segment.SerfConfig = serfConf
+	}
 }
 
 // validateFIPSConfig is a noop stub for the func defined in agent_ent.go
