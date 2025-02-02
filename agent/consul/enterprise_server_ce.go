@@ -35,7 +35,7 @@ func (s *Server) initEnterprise(_ Deps) error {
 
 	s.segmentLan = make(map[string]*serf.Serf, len(s.config.Segments))
 
-	s.config.OverrideInitialSerfTags = s.OverrideInitialSerfTags
+	//s.config.OverrideInitialSerfTags = s.OverrideInitialSerfTags
 
 	return nil
 }
