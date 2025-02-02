@@ -141,6 +141,11 @@ func (s *Server) GetMatchingLANCoordinate(_, segment string) (*coordinate.Coordi
 		return s.serfLAN.GetCoordinate()
 	}
 
+	segmentLan := s.segmentLan[segment]
+	if segmentLan == nil {
+		return nil, fmt.Errorf("segment not found: '%s'", segment)
+	}
+
 	return s.segmentLan[segment].GetCoordinate()
 }
 

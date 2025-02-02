@@ -7,7 +7,6 @@ package consul
 
 import (
 	"fmt"
-	"github.com/hashicorp/consul/agent/metadata"
 	"net"
 	"strings"
 
@@ -79,16 +78,16 @@ func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Liste
 // floodSegments is a NOP in the CE version of Consul.
 func (s *Server) floodSegments(config *Config) {
 
-	for _, sc := range config.Segments {
-		//Fire up the join flooder.
-		addrFn := func(s *metadata.Server) (string, error) {
-
-			addr := s.SegmentAddrs[sc.Name]
-			port := s.SegmentPorts[sc.Name]
-
-			return fmt.Sprintf("%s:%d", addr, port), nil
-		}
-
-		go s.Flood(addrFn, s.segmentLan[sc.Name])
-	}
+	//for _, sc := range config.Segments {
+	//	//Fire up the join flooder.
+	//	addrFn := func(s *metadata.Server) (string, error) {
+	//
+	//		addr := s.SegmentAddrs[sc.Name]
+	//		port := s.SegmentPorts[sc.Name]
+	//
+	//		return fmt.Sprintf("%s:%d", addr, port), nil
+	//	}
+	//
+	//	go s.Flood(addrFn, s.segmentLan[sc.Name])
+	//}
 }
