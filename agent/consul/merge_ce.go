@@ -12,6 +12,13 @@ import (
 )
 
 func (md *lanMergeDelegate) enterpriseNotifyMergeMember(m *serf.Member) error {
+
+	if segment := m.Tags["segment"]; segment != "" {
+		if md.segment != segment {
+			return fmt.Errorf("Member '%s' trying to connect to wrong segment '%s'", m.Name, md.segment)
+		}
+	}
+
 	if memberFIPS := m.Tags["fips"]; memberFIPS != "" {
 		return fmt.Errorf("Member '%s' is FIPS Consul; FIPS Consul is only available in Consul Enterprise",
 			m.Name)
