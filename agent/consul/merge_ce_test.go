@@ -47,6 +47,7 @@ func TestMerge_CE_LAN(t *testing.T) {
 
 	cases := map[string]testcase{
 		"node in a segment": {
+			segment: "alpha",
 			members: []*serf.Member{
 				makeTestNode(t, testMember{
 					dc:      "dc1",
@@ -55,7 +56,19 @@ func TestMerge_CE_LAN(t *testing.T) {
 					segment: "alpha",
 				}),
 			},
-			expect: `Member 'node1' part of segment 'alpha'; Network Segments are a Consul Enterprise feature`,
+			expect: ``,
+		},
+		"node in the wrong segment": {
+			segment: "beta",
+			members: []*serf.Member{
+				makeTestNode(t, testMember{
+					dc:      "dc1",
+					name:    "node1",
+					build:   "0.7.5",
+					segment: "alpha",
+				}),
+			},
+			expect: `Member 'node1' trying to connect to wrong segment 'beta'`,
 		},
 		"node in a partition": {
 			members: []*serf.Member{

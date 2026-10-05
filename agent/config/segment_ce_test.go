@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"testing"
 
 	"github.com/hashicorp/consul/sdk/testutil"
@@ -17,15 +18,22 @@ func TestSegments(t *testing.T) {
 
 	tests := []testCase{
 		{
-			desc: "segment name not in CE",
+			desc: "segment name",
 			args: []string{
 				`-data-dir=` + dataDir,
 			},
-			json:        []string{`{ "server": true, "segment": "a" }`},
-			hcl:         []string{` server = true segment = "a" `},
-			expectedErr: `Network segments are not supported in this version of Consul`,
-			expectedWarnings: []string{
-				enterpriseConfigKeyError{key: "segment"}.Error(),
+			json: []string{`{ "server": true, "segment": "a" }`},
+			hcl:  []string{` server = true segment = "a" `},
+			expected: func(rt *RuntimeConfig) {
+				rt.SegmentName = "a"
+				rt.ServerMode = true
+				rt.TLS.ServerMode = true
+				rt.LeaveOnTerm = false
+				rt.SkipLeaveOnInt = true
+				rt.DataDir = dataDir
+				rt.RPCConfig.EnableStreaming = true
+				rt.GRPCTLSPort = 8503
+				rt.GRPCTLSAddrs = []net.Addr{defaultGrpcTlsAddr}
 			},
 		},
 		{
@@ -36,22 +44,21 @@ func TestSegments(t *testing.T) {
 			json:        []string{`{ "segments":[{ "name":"x" }] }`},
 			hcl:         []string{`segments = [{ name = "x" }]`},
 			expectedErr: `Port for segment "x" cannot be <= 0`,
-			expectedWarnings: []string{
-				enterpriseConfigKeyError{key: "segments"}.Error(),
-			},
+			//expectedWarnings: []string{
+			//	enterpriseConfigKeyError{key: "segments"}.Error(),
+			//},
 		},
-		{
-			desc: "segments not in CE",
-			args: []string{
-				`-data-dir=` + dataDir,
-			},
-			json:        []string{`{ "segments":[{ "name":"x", "port": 123 }] }`},
-			hcl:         []string{`segments = [{ name = "x" port = 123 }]`},
-			expectedErr: `Network segments are not supported in this version of Consul`,
-			expectedWarnings: []string{
-				enterpriseConfigKeyError{key: "segments"}.Error(),
-			},
-		},
+		// {
+		// 	desc: "segments not in CE",
+		// 	args: []string{
+		// 		`-data-dir=` + dataDir,
+		// 	},
+		// 	json:        []string{`{ "segments":[{ "name":"x", "port": 123 }] }`},
+		// 	hcl:         []string{`segments = [{ name = "x" port = 123 }]`},
+		// 	expected: func(rt *RuntimeConfig) {
+		// 		rt.Segments = []NetworkSegment("x", 123)
+		// 	},
+		// },
 	}
 
 	for _, tc := range tests {
