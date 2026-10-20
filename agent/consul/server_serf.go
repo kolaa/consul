@@ -60,9 +60,22 @@ func (s *Server) setupSerf(opts setupSerfOptions) (*serf.Serf, *serf.Config, err
 		return nil, nil, err
 	}
 
+	var mergeDelegate *lanMergeDelegate
+	if md, ok := conf.Merge.(*lanMergeDelegate); ok {
+		mergeDelegate = md
+		// Know our own address before serf.Create, so that the snapshot
+		// rejoin it performs can already be recognized as a merge with
+		// ourselves under a previous identity.
+		md.setSelfAddr(conf.MemberlistConfig.AdvertiseAddr)
+	}
+
 	cluster, err := serf.Create(conf)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if mergeDelegate != nil {
+		mergeDelegate.setStaleSelfHandler(pruneStaleSelfRecordsEvictor(cluster, s.logger))
 	}
 
 	return cluster, conf, nil

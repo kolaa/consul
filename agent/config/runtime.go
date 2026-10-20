@@ -1092,6 +1092,26 @@ type RuntimeConfig struct {
 	// flag: -rejoin
 	RejoinAfterLeave bool
 
+	// SanitizeSerfSnapshotOnConfigChange makes the agent drop every serf
+	// gossip snapshot it finds in the data directory whenever the identity of
+	// its gossip pools changed since the snapshots were written - node name,
+	// datacenter, network segment, or the set of segments and their ports.
+	//
+	// A serf snapshot records member names and addresses only, never the
+	// segment tags, so on start it is replayed as a plain "rejoin these
+	// known peers" list. After a rename or a segment change that list points
+	// at peers that no longer belong to the agent's own pool, and the agent
+	// either flaps leave/join forever or refuses to join with a
+	// wrong-segment error.
+	//
+	// This is opt-in because the first start with the option enabled removes
+	// the existing snapshots, which disables Serf's built-in "rejoin the
+	// cluster I was part of" behavior until retry_join or an explicit join
+	// repopulates it.
+	//
+	// hcl: sanitize_serf_snapshot_on_config_change = (true|false)
+	SanitizeSerfSnapshotOnConfigChange bool
+
 	// RequestLimitsMode will disable or enable rate limiting.  If not disabled, it
 	// enforces the action that will occur when RequestLimitsReadRate
 	// or RequestLimitsWriteRate is exceeded.  The default value of "disabled" will

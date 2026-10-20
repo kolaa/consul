@@ -662,6 +662,14 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start Consul enterprise component: %v", err)
 	}
 
+	// Drop gossip snapshots that were written for a different node name,
+	// datacenter or network segment before any serf pool gets to replay them.
+	// This has to happen before the server or the client is created, because
+	// serf.Create already rejoins the peers recorded in the snapshot.
+	if err := sanitizeSerfSnapshots(c, a.logger); err != nil {
+		return fmt.Errorf("failed to sanitize serf snapshots: %v", err)
+	}
+
 	// Setup either the client or the server.
 	var consulServer *consul.Server
 	if c.ServerMode {

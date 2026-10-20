@@ -145,7 +145,7 @@ func NewClient(config *Config, deps Deps) (*Client, error) {
 	}
 
 	// Initialize the LAN Serf
-	c.serf, err = c.setupSerf(config.SerfLANConfig, c.eventCh, serfLANSnapshot)
+	c.serf, err = c.setupSerf(config.SerfLANConfig, c.eventCh, clientSerfSnapshotPath(config.Segment))
 	if err != nil {
 		c.Shutdown()
 		return nil, fmt.Errorf("Failed to start lan serf: %v", err)
@@ -219,7 +219,14 @@ func (c *Client) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, erro
 			c.config.AgentEnterpriseMeta().PartitionOrDefault(),
 		)
 	}
-	return c.serf.Join(addrs, true)
+	n, err := c.serf.Join(addrs, true)
+
+	// Whatever we just pulled in may include a copy of this very agent under
+	// the name it used before a rename. Clean those up right away: otherwise
+	// the old name stays visible in "consul members" until serf reaps it.
+	pruneStaleSelfRecords(c.serf, c.config.NodeID, c.config.NodeName, c.logger)
+
+	return n, err
 }
 
 // AgentLocalMember is used to retrieve the LAN member for the local node.

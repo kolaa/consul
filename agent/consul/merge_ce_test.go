@@ -46,7 +46,8 @@ func TestMerge_CE_LAN(t *testing.T) {
 	}
 
 	cases := map[string]testcase{
-		"node in a segment": {
+		"node in the matching segment": {
+			segment: "alpha",
 			members: []*serf.Member{
 				makeTestNode(t, testMember{
 					dc:      "dc1",
@@ -56,6 +57,42 @@ func TestMerge_CE_LAN(t *testing.T) {
 				}),
 			},
 			expect: ``,
+		},
+		"node in a segment trying to merge into the default pool": {
+			segment: "",
+			members: []*serf.Member{
+				makeTestNode(t, testMember{
+					dc:      "dc1",
+					name:    "node1",
+					build:   "0.7.5",
+					segment: "alpha",
+				}),
+			},
+			expect: `Member 'node1' part of wrong segment 'alpha' (expected '')`,
+		},
+		"default pool node trying to merge into a segment pool": {
+			segment: "alpha",
+			members: []*serf.Member{
+				makeTestNode(t, testMember{
+					dc:      "dc1",
+					name:    "node1",
+					build:   "0.7.5",
+					segment: "",
+				}),
+			},
+			expect: `Member 'node1' part of wrong segment '' (expected 'alpha')`,
+		},
+		"node in a different segment": {
+			segment: "alpha",
+			members: []*serf.Member{
+				makeTestNode(t, testMember{
+					dc:      "dc1",
+					name:    "node1",
+					build:   "0.7.5",
+					segment: "beta",
+				}),
+			},
+			expect: `Member 'node1' part of wrong segment 'beta' (expected 'alpha')`,
 		},
 		"node in a partition": {
 			members: []*serf.Member{

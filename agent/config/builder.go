@@ -1562,6 +1562,23 @@ func (b *builder) validate(rt RuntimeConfig) error {
 		b.warn("rpc.enable_streaming = true has no effect when not running in server mode")
 	}
 
+	// A client in a network segment gossip only with that segment's serf pool
+	// on the servers. memberlist resolves a retry_join address that carries no
+	// explicit port against this agent's own serf LAN bind port, which points
+	// at the servers' default LAN pool instead, so the join is rejected as a
+	// wrong-segment merge. Only flag literal addresses here; cloud auto-join
+	// (provider=...) results are resolved at join time.
+	if !rt.ServerMode && rt.SegmentName != "" {
+		for _, addr := range rt.RetryJoinLAN {
+			if strings.Contains(addr, "provider=") {
+				continue
+			}
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				b.warn("retry_join address %q has no port, but segment = %q is set: without the segment's serf port the join targets the default LAN pool and will be rejected. Add the port explicitly (host:port).", addr, rt.SegmentName)
+			}
+		}
+	}
+
 	if rt.AutoEncryptAllowTLS && !rt.TLS.InternalRPC.VerifyIncoming {
 		b.warn("if auto_encrypt.allow_tls is turned on, tls.internal_rpc.verify_incoming should be enabled (either explicitly or via tls.defaults.verify_incoming). It is necessary to turn it off during a migration to TLS, but it should definitely be turned on afterwards.")
 	}

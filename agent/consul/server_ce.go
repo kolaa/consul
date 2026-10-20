@@ -7,9 +7,12 @@ package consul
 
 import (
 	"fmt"
-	"github.com/hashicorp/consul/agent/structs"
+	"net"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/consul/agent/structs"
 
 	"github.com/armon/go-metrics"
 
@@ -41,7 +44,118 @@ func (s *Server) enterpriseValidateJoinWAN() error {
 // JoinLAN is used to have Consul join the inner-DC pool The target address
 // should be another node inside the DC listening on the Serf LAN address
 func (s *Server) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, error) {
-	return s.serfLAN.Join(addrs, true)
+	// retry_join is shared by the default LAN pool and every segment pool.
+	// memberlist resolves addresses that carry no explicit port against the
+	// *local* bind port of the pool doing the join, so a bare address would
+	// otherwise only ever reach the default LAN pool (and, when used from a
+	// segment pool, would silently target the wrong remote pool). Expand the
+	// addresses per pool so a single retry_join entry reaches all of them.
+	lanAddrs, segmentAddrs := segmentJoinAddrs(addrs, s.config.Segments)
+
+	var merr error
+	total := 0
+
+	if len(lanAddrs) > 0 {
+		n, err := s.serfLAN.Join(lanAddrs, true)
+		total += n
+		if err != nil {
+			merr = multierror.Append(merr, err)
+		}
+	}
+
+	for name, segAddrs := range segmentAddrs {
+		pool := s.segmentLan[name]
+		if pool == nil {
+			merr = multierror.Append(merr, fmt.Errorf("cannot join unknown network segment '%s'", name))
+			continue
+		}
+		n, err := pool.Join(segAddrs, true)
+		total += n
+		if err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("failed to join segment '%s': %w", name, err))
+		}
+	}
+
+	// Whatever we just pulled in may include a copy of this very agent under
+	// the name it used before a rename. Clean those up right away: otherwise
+	// the old name stays visible in "consul members" until serf reaps it,
+	// which can take days and keeps the router pointing at a node that no
+	// longer exists.
+	s.pruneStaleSelf()
+
+	if merr != nil {
+		return total, merr
+	}
+	return total, nil
+}
+
+// pruneStaleSelf drops records that carry this agent's node ID under a name
+// this agent no longer uses from every LAN pool.
+func (s *Server) pruneStaleSelf() {
+	logger := s.logger
+	nodeID := s.config.NodeID
+	nodeName := s.config.NodeName
+
+	pruneStaleSelfRecords(s.serfLAN, nodeID, nodeName, logger)
+	for name, pool := range s.segmentLan {
+		pruneStaleSelfRecords(pool, nodeID, nodeName, logger.With("segment", name))
+	}
+}
+
+// segmentJoinAddrs splits join addresses into the addresses that belong to
+// the default serf LAN pool and, per segment name, the addresses that belong
+// to that segment's pool.
+//
+//   - An address without an explicit port is joined into the default pool
+//     unchanged (memberlist resolves it against the local serf LAN bind port)
+//     and additionally into every configured segment pool using that segment's
+//     port.
+//   - An address with an explicit port is joined only into the pool that
+//     listens on that port: a configured segment if the port matches one, and
+//     the default LAN pool otherwise.
+//
+// This assumes the (usual) deployment where every server in the datacenter is
+// configured with the same segment names and ports.
+func segmentJoinAddrs(addrs []string, segments []NetworkSegment) ([]string, map[string][]string) {
+	segmentByPort := make(map[string]string, len(segments))
+	for _, segment := range segments {
+		if segment.Port == 0 {
+			continue
+		}
+		segmentByPort[strconv.Itoa(segment.Port)] = segment.Name
+	}
+
+	lanAddrs := make([]string, 0, len(addrs))
+	segmentAddrs := make(map[string][]string)
+
+	for _, addr := range addrs {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+			port = ""
+		}
+
+		if port == "" {
+			lanAddrs = append(lanAddrs, host)
+			for _, segment := range segments {
+				if segment.Port == 0 {
+					continue
+				}
+				segmentAddrs[segment.Name] = append(
+					segmentAddrs[segment.Name],
+					net.JoinHostPort(host, strconv.Itoa(segment.Port)))
+			}
+			continue
+		}
+
+		if name, ok := segmentByPort[port]; ok {
+			segmentAddrs[name] = append(segmentAddrs[name], addr)
+			continue
+		}
+		lanAddrs = append(lanAddrs, addr)
+	}
+
+	return lanAddrs, segmentAddrs
 }
 
 // removeFailedNode is used to remove a failed node from the cluster

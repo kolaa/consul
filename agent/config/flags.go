@@ -87,6 +87,7 @@ func AddFlags(fs *flag.FlagSet, f *LoadOpts) {
 	add(&f.FlagValues.RetryJoinWAN, "retry-join-wan", "Address of an agent to join -wan at start time with retries enabled. Can be specified multiple times.")
 	add(&f.FlagValues.RetryJoinMaxAttemptsLAN, "retry-max", "Maximum number of join attempts. Defaults to 0, which will retry indefinitely.")
 	add(&f.FlagValues.RetryJoinMaxAttemptsWAN, "retry-max-wan", "Maximum number of join -wan attempts. Defaults to 0, which will retry indefinitely.")
+	add(&f.FlagValues.SanitizeSerfSnapshotOnConfigChange, "sanitize-serf-snapshot-on-config-change", "Removes the serf gossip snapshots from the data dir at start time when the node name, datacenter, network segment, or the configured segments changed since they were written.")
 	add(&f.FlagValues.SerfAllowedCIDRsLAN, "serf-lan-allowed-cidrs", "Networks (eg: 192.168.1.0/24) allowed for Serf LAN. Can be specified multiple times.")
 	add(&f.FlagValues.SerfAllowedCIDRsWAN, "serf-wan-allowed-cidrs", "Networks (eg: 192.168.1.0/24) allowed for Serf WAN (other datacenters). Can be specified multiple times.")
 	add(&f.FlagValues.SerfBindAddrLAN, "serf-lan-bind", "Address to bind Serf LAN listeners to.")

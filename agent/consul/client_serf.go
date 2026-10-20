@@ -18,6 +18,27 @@ import (
 	"github.com/hashicorp/consul/types"
 )
 
+// clientSerfSnapshotPath returns the serf snapshot file used by a client's
+// single LAN pool.
+//
+// A client belongs to exactly one pool: the default one, or one named
+// segment. The snapshot has to follow it, because a serf snapshot records
+// member names and addresses only and never the segment tags. With a shared
+// file an agent that is moved from the default pool into a segment (or the
+// other way round) would silently replay its previous pool's members as
+// valid join targets on the next start, dragging it back into the segment it
+// was moved out of - which is what produced the endless leave/join churn and
+// the wrong-segment join errors.
+//
+// Servers keep one snapshot per pool already (serf/local.snapshot for the
+// default pool and serf/<segment>.snapshot for every segment).
+func clientSerfSnapshotPath(segment string) string {
+	if segment == "" {
+		return serfLANSnapshot
+	}
+	return fmt.Sprintf("serf/local-%s.snapshot", strings.ToLower(segment))
+}
+
 // setupSerf is used to setup and initialize a Serf
 func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (*serf.Serf, error) {
 	conf.Init()
@@ -51,7 +72,7 @@ func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (
 	conf.EventCh = ch
 	conf.ProtocolVersion = protocolVersionMap[c.config.ProtocolVersion]
 	conf.RejoinAfterLeave = c.config.RejoinAfterLeave
-	conf.Merge = &lanMergeDelegate{
+	mergeDelegate := &lanMergeDelegate{
 		dc:        c.config.Datacenter,
 		nodeID:    c.config.NodeID,
 		nodeName:  c.config.NodeName,
@@ -59,6 +80,7 @@ func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (
 		server:    false,
 		partition: c.config.AgentEnterpriseMeta().PartitionOrDefault(),
 	}
+	conf.Merge = mergeDelegate
 
 	conf.SnapshotPath = filepath.Join(c.config.DataDir, path)
 	if err := lib.EnsurePath(conf.SnapshotPath, false); err != nil {
@@ -73,7 +95,19 @@ func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (
 
 	enterpriseModifyClientSerfConfigLAN(c.config, conf)
 
-	return serf.Create(conf)
+	// Know our own address before serf.Create, so that the snapshot rejoin it
+	// performs can already be recognized as a merge with ourselves under a
+	// previous identity.
+	mergeDelegate.setSelfAddr(conf.MemberlistConfig.AdvertiseAddr)
+
+	cluster, err := serf.Create(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	mergeDelegate.setStaleSelfHandler(pruneStaleSelfRecordsEvictor(cluster, c.logger))
+
+	return cluster, nil
 }
 
 // lanEventHandler is used to handle events from the lan Serf cluster

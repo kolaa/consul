@@ -322,6 +322,7 @@
         "wan_foo=bar wan_key=hidden wan_secret=hidden wan_bang=bar"
     ],
     "Revision": "",
+    "SanitizeSerfSnapshotOnConfigChange": false,
     "SegmentLimit": 0,
     "SegmentName": "",
     "SegmentNameLimit": 0,

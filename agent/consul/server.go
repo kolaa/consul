@@ -727,6 +727,13 @@ func NewServer(config *Config, flat Deps, externalGRPCServer *grpc.Server,
 	}
 	go s.lanEventHandler()
 
+	// Publish the quorum heartbeat so that a server which comes back without a
+	// raft leader (or without enough alive peers) is visible in the logs and
+	// in the metrics instead of only showing up as blocked requests.
+	if !s.config.DevMode {
+		go s.monitorQuorumHealth()
+	}
+
 	// Start the flooders after the LAN event handler is wired up.
 	s.floodSegments(config)
 
