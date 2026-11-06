@@ -8,9 +8,12 @@ package consul
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/go-metrics/prometheus"
+
+	"github.com/hashicorp/consul/agent/metadata"
 )
 
 var SegmentCESummaries = []prometheus.SummaryDefinition{
@@ -78,19 +81,38 @@ func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Liste
 	return nil
 }
 
-// floodSegments is a NOP in the CE version of Consul.
+// floodSegments starts one flooder per segment pool. Every flooder keeps the
+// servers known from the default LAN pool joined into its segment pool, so
+// segment pools converge across servers no matter which shape retry_join
+// took: a bare address, an explicit host:port, or none at all.
+//
+// This is variant B of P0-1: no sl_* tags are published, so nothing here is
+// bounded by serf's 512-byte tag budget and any number of segments works.
+// The price is the same assumption the bare-address expansion in JoinLAN
+// already made: the segment must listen on the same port on every server and
+// be reachable on the server's LAN address.
 func (s *Server) floodSegments(config *Config) {
+	for _, sc := range config.Segments {
+		// sc is per-iteration (go 1.22+, see go.mod), so the closure may
+		// capture it directly.
+		addrFn := func(srv *metadata.Server) (string, error) {
+			return segmentFloodAddr(srv, sc.Port)
+		}
+		go s.Flood(addrFn, s.segmentLan[sc.Name])
+	}
+}
 
-	//for _, sc := range config.Segments {
-	//	//Fire up the join flooder.
-	//	addrFn := func(s *metadata.Server) (string, error) {
-	//
-	//		addr := s.SegmentAddrs[sc.Name]
-	//		port := s.SegmentPorts[sc.Name]
-	//
-	//		return fmt.Sprintf("%s:%d", addr, port), nil
-	//	}
-	//
-	//	go s.Flood(addrFn, s.segmentLan[sc.Name])
-	//}
+// segmentFloodAddr returns the address of the given server's copy of a
+// segment pool: the host the server is reachable on (its gossip address,
+// carried in the RPC address) plus the segment's port. The RPC port itself
+// is deliberately discarded.
+func segmentFloodAddr(srv *metadata.Server, port int) (string, error) {
+	if srv.Addr == nil {
+		return "", fmt.Errorf("server %s has no address", srv.Name)
+	}
+	host, _, err := net.SplitHostPort(srv.Addr.String())
+	if err != nil {
+		return "", fmt.Errorf("server %s: cannot derive segment address: %w", srv.Name, err)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }

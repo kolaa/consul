@@ -8,7 +8,9 @@ package consul
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -41,70 +43,62 @@ func (s *Server) enterpriseValidateJoinWAN() error {
 }
 
 // JoinLAN is used to have Consul join the inner-DC pool The target address
-// should be another node inside the DC listening on the Serf LAN address
+// should be another node inside the DC listening on the Serf LAN address.
+//
+// Only the default pool decides whether the join succeeded (P1-3):
+// retry_join treats a non-nil error as a failure and, with retry_max set,
+// exits the agent with "max join retry exhausted" - so a segment pool that
+// cannot be reached (segment port firewalled, first server of a rolling
+// upgrade not yet listening) must not fail an otherwise successful LAN
+// join. Segment pools are converged by the flooders anyway (see
+// floodSegments); explicit host:<segment port> entries are honoured
+// best-effort and only logged.
 func (s *Server) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, error) {
-	// retry_join is shared by the default LAN pool and every segment pool.
-	// memberlist resolves addresses that carry no explicit port against the
-	// *local* bind port of the pool doing the join, so a bare address would
-	// otherwise only ever reach the default LAN pool (and, when used from a
-	// segment pool, would silently target the wrong remote pool). Expand the
-	// addresses per pool so a single retry_join entry reaches all of them.
-	lanAddrs, segmentAddrs := segmentJoinAddrs(addrs, s.config.Segments)
+	lanAddrs, segmentAddrs := segmentJoinAddrsExplicitOnly(addrs, s.config.Segments)
 
-	var merr error
-	total := 0
+	// Every address carrying a configured segment port means the default
+	// pool has nothing to join. Returning (0, nil) here would let
+	// retry_join log a successful join while the node stays out of the LAN
+	// cluster, so fail loudly instead.
+	if len(addrs) > 0 && len(lanAddrs) == 0 {
+		return 0, fmt.Errorf(
+			"cannot join the default LAN pool: every join address (%v) carries a configured segment port; use a bare address or one with the serf_lan port instead",
+			addrs)
+	}
 
+	n := 0
+	var err error
 	if len(lanAddrs) > 0 {
-		n, err := s.serfLAN.Join(lanAddrs, true)
-		total += n
-		if err != nil {
-			merr = multierror.Append(merr, err)
-		}
+		n, err = s.serfLAN.Join(lanAddrs, true)
 	}
 
-	for name, segAddrs := range segmentAddrs {
-		pool := s.segmentLan[name]
-		if pool == nil {
-			merr = multierror.Append(merr, fmt.Errorf("cannot join unknown network segment '%s'", name))
-			continue
-		}
-		n, err := pool.Join(segAddrs, true)
-		total += n
-		if err != nil {
-			merr = multierror.Append(merr, fmt.Errorf("failed to join segment '%s': %w", name, err))
+	// Best-effort segment joins. The sorted order keeps the WARNs
+	// deterministic (see P3); keys come from s.config.Segments, exactly like
+	// the keys of s.segmentLan.
+	for _, name := range slices.Sorted(maps.Keys(segmentAddrs)) {
+		if _, jerr := s.segmentLan[name].Join(segmentAddrs[name], true); jerr != nil {
+			s.logger.Warn("segment join failed; flood-join will retry",
+				"segment", name, "error", jerr)
 		}
 	}
-
-	if merr != nil {
-		return total, merr
-	}
-	return total, nil
+	return n, err
 }
 
-// segmentJoinAddrs splits join addresses into the addresses that belong to
-// the default serf LAN pool and, per segment name, the addresses that belong
-// to that segment's pool.
+// segmentJoinAddrsExplicitOnly splits join addresses into the addresses that
+// belong to the default serf LAN pool and, per segment name, the addresses
+// that belong to that segment's pool.
 //
-//   - An address without an explicit port is joined into the default pool
-//     unchanged (memberlist resolves it against the local serf LAN bind port)
-//     and additionally into every configured segment pool using that segment's
-//     port.
-//   - An address with an explicit port is joined only into the pool that
-//     listens on that port: a configured segment if the port matches one, and
-//     the default LAN pool otherwise.
+//   - An address with an explicit port matching a configured segment port
+//     goes to that segment's pool only.
+//   - Everything else - a bare address or an explicit non-segment port -
+//     goes to the default pool only. Bare addresses are deliberately not
+//     expanded per segment any more: segment pools are converged by the
+//     flooders (see floodSegments), so the default pool alone decides
+//     whether a retry_join attempt succeeded (P1-3).
 //
 // This assumes the (usual) deployment where every server in the datacenter is
 // configured with the same segment names and ports.
-// hasPort mirrors memberlist's util.go hasPort so we classify addresses the
-// same way memberlist will when it resolves them.
-func hasPort(s string) bool {
-	if strings.LastIndex(s, "[") == 0 {
-		return strings.LastIndex(s, ":") > strings.LastIndex(s, "]")
-	}
-	return strings.Count(s, ":") == 1
-}
-
-func segmentJoinAddrs(addrs []string, segments []NetworkSegment) ([]string, map[string][]string) {
+func segmentJoinAddrsExplicitOnly(addrs []string, segments []NetworkSegment) ([]string, map[string][]string) {
 	segmentByPort := make(map[int]string, len(segments))
 	for _, segment := range segments {
 		if segment.Port > 0 {
@@ -116,26 +110,12 @@ func segmentJoinAddrs(addrs []string, segments []NetworkSegment) ([]string, map[
 	segmentAddrs := make(map[string][]string)
 
 	for _, addr := range addrs {
-		if !hasPort(addr) {
-			// memberlist resolves this against the local serf_lan port.
-			lanAddrs = append(lanAddrs, addr)
-			host := strings.Trim(addr, "[]") // "[fd00::1]" -> "fd00::1"
-			for _, segment := range segments {
-				if segment.Port > 0 {
-					segmentAddrs[segment.Name] = append(
-						segmentAddrs[segment.Name],
-						net.JoinHostPort(host, strconv.Itoa(segment.Port)))
+		if _, portStr, err := net.SplitHostPort(addr); err == nil {
+			if port, perr := strconv.Atoi(portStr); perr == nil {
+				if name, ok := segmentByPort[port]; ok {
+					segmentAddrs[name] = append(segmentAddrs[name], addr)
+					continue
 				}
-			}
-			continue
-		}
-
-		_, portStr, err := net.SplitHostPort(addr)
-		port, perr := strconv.Atoi(portStr)
-		if err == nil && perr == nil {
-			if name, ok := segmentByPort[port]; ok {
-				segmentAddrs[name] = append(segmentAddrs[name], addr)
-				continue
 			}
 		}
 		lanAddrs = append(lanAddrs, addr)

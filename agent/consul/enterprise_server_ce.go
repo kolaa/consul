@@ -8,11 +8,9 @@ package consul
 import (
 	"context"
 	"errors"
-	"fmt"
 	"maps"
 	"net"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -160,13 +158,6 @@ func (s *Server) shutdownSerfLAN() {
 	}
 	for _, ln := range s.segmentListeners {
 		_ = ln.Close()
-	}
-}
-
-func (s *Server) OverrideInitialSerfTags(tags map[string]string) {
-
-	for _, segment := range s.config.Segments {
-		tags[fmt.Sprint("sl_", segment.Name)] = net.JoinHostPort(segment.Bind, strconv.Itoa(segment.Port))
 	}
 }
 
