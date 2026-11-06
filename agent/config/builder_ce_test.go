@@ -193,10 +193,18 @@ func TestValidateEnterpriseConfig_SegmentClientRetryJoin(t *testing.T) {
 				RetryJoinLAN: []string{"10.0.0.5:8303"},
 			},
 		},
-		"cloud auto-join results are not validated": {
+		"cloud auto-join with the default serf_lan port is rejected": {
 			rt: RuntimeConfig{
 				SegmentName:  "alpha",
 				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"provider=aws tag_key=consul segment=alpha"},
+			},
+			wantErr: "cannot be used",
+		},
+		"cloud auto-join with ports.serf_lan overridden is accepted": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8303,
 				RetryJoinLAN: []string{"provider=aws tag_key=consul segment=alpha"},
 			},
 		},

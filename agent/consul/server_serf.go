@@ -87,6 +87,14 @@ func (s *Server) setupSerfConfig(opts setupSerfOptions) (*serf.Config, error) {
 	conf.Init()
 
 	if opts.WAN {
+		// Reject a dynamic WAN bind port before the transport below binds an
+		// ephemeral socket: the transport is created by hand, so memberlist
+		// never writes the auto-bound port back into the config and
+		// NewServer's dynamic-port check would fire later anyway - without
+		// the Shutdown() that this early error path triggers.
+		if err := validateWANBindPort(conf); err != nil {
+			return nil, err
+		}
 		conf.NodeName = fmt.Sprintf("%s.%s", s.config.NodeName, s.config.Datacenter)
 	} else {
 		conf.NodeName = s.config.NodeName

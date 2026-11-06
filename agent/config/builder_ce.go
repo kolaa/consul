@@ -98,14 +98,19 @@ func (*builder) validateEnterpriseConfig(rt RuntimeConfig) error {
 		return nil
 	}
 	// A client in a network segment gossips only with that segment's serf pool
-	// on the servers. With the default serf_lan port, memberlist resolves a
-	// retry_join address that carries no explicit port against the default LAN
-	// pool instead, so the join is rejected as a wrong-segment merge. Only
-	// flag literal addresses here; cloud auto-join (provider=...) results are
-	// resolved at join time.
+	// on the servers. With the default serf_lan port, a retry_join address that
+	// carries no explicit port resolves against the default LAN pool instead,
+	// so the join is rejected as a wrong-segment merge. This applies to cloud
+	// auto-join (provider=...) too: go-discover emits bare addresses with no
+	// port, which would resolve the same wrong way at join time - failing here
+	// is the only way to tell the user before the agent starts an endless
+	// retry loop.
 	for _, addr := range rt.RetryJoinLAN {
 		if strings.Contains(addr, "provider=") {
-			continue
+			return fmt.Errorf("retry_join %q (cloud auto-join) cannot be used while segment = %q and ports.serf_lan "+
+				"is the default %d: discovery returns addresses with no port, which resolve to the servers' default "+
+				"LAN pool instead of the segment; use host:<segment port> or set ports.serf_lan to the segment port",
+				addr, rt.SegmentName, defaultSerfLANPort)
 		}
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			return fmt.Errorf("retry_join %q has no port while segment = %q and ports.serf_lan "+
