@@ -9,13 +9,15 @@ import (
 	"context"
 	"fmt"
 
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/hashicorp/serf/serf"
+
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/serf/serf"
 )
 
 // enterpriseAgent embeds fields that we only access in consul-enterprise builds
@@ -38,21 +40,32 @@ func fillHealthCheckEnterpriseMeta(_ *api.HealthCheck, _ *acl.EnterpriseMeta) {}
 // LANSendUserEvent broadcasts the same payload bytes to all of them over one
 // shared channel, so without dedup the event would be ingested once per pool.
 // Keying on the payload bytes is enough — every pool carries the identical
-// []byte — and spares a second msgpack decode.
+// []byte — and spares a second msgpack decode. The window grows with the pool
+// count, so a burst of events across N+1 pools cannot evict an event's first
+// copy before its last one arrives.
 func (a *Agent) initEnterprise(consulCfg *consul.Config) error {
 	if consulCfg.UserEventHandler == nil {
 		return nil
 	}
-	dedup := NewEventDedup(256)
+	seen, err := lru.New(userEventDedupPerPool * (1 + len(consulCfg.Segments)))
+	if err != nil {
+		return fmt.Errorf("failed to create user event dedup: %w", err)
+	}
 	inner := consulCfg.UserEventHandler
 	consulCfg.UserEventHandler = func(e serf.UserEvent) {
-		if !dedup.FirstSeen(string(e.Payload)) {
-			return
+		if len(e.Payload) > 0 {
+			if dup, _ := seen.ContainsOrAdd(string(e.Payload), struct{}{}); dup {
+				return
+			}
 		}
 		inner(e)
 	}
 	return nil
 }
+
+// userEventDedupPerPool is how many recent user events the dedup remembers
+// for each LAN pool the agent belongs to.
+const userEventDedupPerPool = 256
 
 // reloadEnterprise is a noop stub for the func defined agent_ent.go
 func (a *Agent) reloadEnterprise(conf *config.RuntimeConfig) error {
@@ -62,8 +75,9 @@ func (a *Agent) reloadEnterprise(conf *config.RuntimeConfig) error {
 // enterpriseConsulConfig applies the community edition adjustments to the
 // consul config at the end of newConsulConfig.
 //
-// agent.segmentConfig() can only build segment pools from library defaults,
-// because agent.go has no enterprise hook at the point where it runs. Now that
+// agent.segmentConfig() builds segment pools from library defaults plus a few
+// LAN settings (CIDRs, reconnect timeout, verify flags), because agent.go has
+// no enterprise hook at the point where it runs. Now that
 // newConsulConfig has applied every gossip_lan.* tuning knob to
 // cfg.SerfLANConfig and setupKeyrings has handed each segment its own keyring,
 // re-clone each segment pool from the final LAN config so the tuned settings
