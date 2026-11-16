@@ -159,6 +159,53 @@ func TestValidateSegments(t *testing.T) {
 			rt:       segmentValidationFixture(segmentCase("ReMoTe", 8303)),
 			wantErrs: []string{`segment name "ReMoTe" is reserved`},
 		},
+		"windows device name con is reserved": {
+			rt:       segmentValidationFixture(segmentCase("con", 8303)),
+			wantErrs: []string{`segment name "con" is reserved`},
+		},
+		"windows device names are reserved case-insensitively": {
+			rt: segmentValidationFixture(
+				segmentCase("NUL", 8303),
+				segmentCase("Aux", 8304),
+				segmentCase("prn", 8305),
+			),
+			wantErrs: []string{
+				`segment name "NUL" is reserved`,
+				`segment name "Aux" is reserved`,
+				`segment name "prn" is reserved`,
+			},
+		},
+		"windows numbered device names are reserved": {
+			rt: segmentValidationFixture(
+				segmentCase("com1", 8303),
+				segmentCase("COM9", 8304),
+				segmentCase("lpt1", 8305),
+				segmentCase("Lpt9", 8306),
+			),
+			wantErrs: []string{
+				`segment name "com1" is reserved`,
+				`segment name "COM9" is reserved`,
+				`segment name "lpt1" is reserved`,
+				`segment name "Lpt9" is reserved`,
+			},
+		},
+		"names that only start like a windows device name are valid": {
+			rt: segmentValidationFixture(
+				segmentCase("console", 8303),
+				segmentCase("com10", 8304),
+				segmentCase("lpt", 8305),
+				segmentCase("aux1", 8306),
+			),
+		},
+		"client segment name is checked for windows device names": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture()
+				rt.ServerMode = false
+				rt.SegmentName = "com3"
+				return rt
+			}(),
+			wantErrs: []string{`segment name "com3" is reserved`},
+		},
 		"blank segment name": {
 			rt:       segmentValidationFixture(segmentCase("", 8303)),
 			wantErrs: []string{`segment name cannot be blank`},
@@ -233,6 +280,17 @@ func TestValidateSegments(t *testing.T) {
 			}(),
 			wantErrs: []string{`segment "beta": rpc_listener would bind 10.0.0.6:8300, already used by segment "alpha" rpc_listener`},
 		},
+		"rpc_listener collides with the segment's own serf bind": {
+			// Bind port == server_port on the segment IP: the rpc_listener
+			// target is already taken by this segment's serf pool, and the
+			// main RPC listener lives elsewhere, so only the loop over the
+			// pools bound so far can catch it.
+			rt: segmentValidationFixture(segmentCase("alpha", 8300, func(s *structs.NetworkSegment) {
+				s.Bind = segTCPAddr("10.0.0.6", 8300)
+				s.RPCListener = true
+			})),
+			wantErrs: []string{`segment "alpha": rpc_listener would bind 10.0.0.6:8300, already used by segment "alpha" bind 10.0.0.6:8300`},
+		},
 		"wildcard bind conflicts with serf_wan bind": {
 			rt: segmentValidationFixture(segmentCase("alpha", 8302, func(s *structs.NetworkSegment) {
 				s.Bind = segTCPAddr("0.0.0.0", 8302)
@@ -305,6 +363,83 @@ func TestValidateSegments(t *testing.T) {
 			}(),
 			wantErrs: []string{`segment name "Remote" is reserved`},
 		},
+		"segment tags beyond the serf tag budget": {
+			rt: func() RuntimeConfig {
+				var segs []structs.NetworkSegment
+				for i := range 20 {
+					name := fmt.Sprintf("seg%02d", i) + strings.Repeat("x", 25) // 30 chars
+					segs = append(segs, segmentCase(name, 9000+i))
+				}
+				rt := segmentValidationFixture(segs...)
+				rt.Datacenter = "dc1"
+				return rt
+			}(),
+			wantErrs: []string{`20 segments need`, `serf allows 512 bytes`},
+		},
+		"small segment set fits the serf tag budget": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(
+					segmentCase("alpha", 8303),
+					segmentCase("bravo", 8304),
+					segmentCase("delta", 8305),
+				)
+				rt.Datacenter = "dc1"
+				return rt
+			}(),
+		},
+		"segment bind conflicts with the HTTP listener": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8500))
+				rt.HTTPAddrs = []net.Addr{segTCPAddr("10.0.0.1", 8500)}
+				return rt
+			}(),
+			wantErrs: []string{`segment "alpha" bind 10.0.0.1:8500 conflicts with HTTP bind 10.0.0.1:8500`},
+		},
+		"segment bind conflicts with a wildcard HTTPS listener": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8501))
+				rt.HTTPSAddrs = []net.Addr{segTCPAddr("0.0.0.0", 8501)}
+				return rt
+			}(),
+			wantErrs: []string{`conflicts with HTTPS bind 0.0.0.0:8501`},
+		},
+		"segment bind conflicts with the gRPC listener": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8502))
+				rt.GRPCAddrs = []net.Addr{segTCPAddr("10.0.0.1", 8502)}
+				return rt
+			}(),
+			wantErrs: []string{`conflicts with gRPC bind 10.0.0.1:8502`},
+		},
+		"segment bind conflicts with the gRPC TLS listener": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8503))
+				rt.GRPCTLSAddrs = []net.Addr{segTCPAddr("10.0.0.1", 8503)}
+				return rt
+			}(),
+			wantErrs: []string{`conflicts with gRPC TLS bind 10.0.0.1:8503`},
+		},
+		"segment bind conflicts with the DNS listener": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8600))
+				rt.DNSAddrs = []net.Addr{
+					segTCPAddr("10.0.0.1", 8600),
+					&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 8600},
+				}
+				return rt
+			}(),
+			wantErrs: []string{`conflicts with DNS bind 10.0.0.1:8600`},
+		},
+		"client listeners on other IPs or unix sockets do not conflict": {
+			rt: func() RuntimeConfig {
+				rt := segmentValidationFixture(segmentCase("alpha", 8500))
+				rt.HTTPAddrs = []net.Addr{
+					segTCPAddr("10.0.0.2", 8500),
+					&net.UnixAddr{Name: "/tmp/consul-http.sock", Net: "unix"},
+				}
+				return rt
+			}(),
+		},
 		"valid client segment name": {
 			rt: func() RuntimeConfig {
 				rt := segmentValidationFixture()
@@ -325,6 +460,92 @@ func TestValidateSegments(t *testing.T) {
 			require.Error(t, err, "expected the segment config to be rejected")
 			for _, want := range tc.wantErrs {
 				require.ErrorContains(t, err, want)
+			}
+		})
+	}
+}
+
+// JoinLAN sends a retry_join entry with a segment port only to that segment's
+// pool, so a server listing nothing but segment ports never joins the default
+// LAN pool. That still loads, but must warn.
+func TestValidateSegments_SegmentOnlyRetryJoinWarns(t *testing.T) {
+	cases := map[string]struct {
+		retryJoin []string
+		wantWarn  bool
+	}{
+		"only segment ports":        {retryJoin: []string{"10.0.0.5:8303", "10.0.0.6:8304"}, wantWarn: true},
+		"a serf_lan port alongside": {retryJoin: []string{"10.0.0.5:8303", "10.0.0.6:8301"}},
+		"a bare host alongside":     {retryJoin: []string{"10.0.0.5:8303", "10.0.0.6"}},
+		"cloud auto-join alongside": {retryJoin: []string{"10.0.0.5:8303", "provider=aws tag_key=consul"}},
+		"no retry_join":             {},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rt := segmentValidationFixture(segmentCase("alpha", 8303), segmentCase("beta", 8304))
+			rt.RetryJoinLAN = tc.retryJoin
+			b := &builder{}
+			require.NoError(t, b.validateSegments(rt))
+
+			var n int
+			for _, w := range b.Warnings {
+				if strings.Contains(w, "every retry_join entry targets a segment port") {
+					n++
+				}
+			}
+			if tc.wantWarn {
+				require.Equal(t, 1, n, "warnings: %q", b.Warnings)
+			} else {
+				require.Zero(t, n, "warnings: %q", b.Warnings)
+			}
+		})
+	}
+}
+
+// Without rpc_listener, a segment's clients dial the segment advertise IP on
+// the server RPC port, which the main RPC listener only answers when it binds
+// a wildcard or that same IP. Load must warn about the unreachable case.
+func TestLoad_SegmentRPCUnreachableWarns(t *testing.T) {
+	cases := map[string]struct {
+		hcl      string
+		wantWarn bool
+	}{
+		"specific RPC bind, other advertise IP": {
+			hcl:      `bind_addr = "127.0.0.1" segments = [{ name = "alpha", port = 8303, advertise = "10.0.0.2" }]`,
+			wantWarn: true,
+		},
+		"rpc_listener on the segment IP": {
+			hcl: `bind_addr = "127.0.0.1" segments = [{ name = "alpha", port = 8303, bind = "10.0.0.2", advertise = "10.0.0.2", rpc_listener = true }]`,
+		},
+		"advertise IP equals the RPC bind IP": {
+			hcl: `bind_addr = "127.0.0.1" segments = [{ name = "alpha", port = 8303, advertise = "127.0.0.1" }]`,
+		},
+		"wildcard RPC bind": {
+			hcl: `bind_addr = "0.0.0.0" segments = [{ name = "alpha", port = 8303, advertise = "10.0.0.2" }]`,
+		},
+		// Behind NAT the segment inherits advertise_addr, which every client
+		// already dials on the server port.
+		"advertise IP equals the RPC advertise IP": {
+			hcl: `bind_addr = "127.0.0.1" advertise_addr = "10.0.0.9" segments = [{ name = "alpha", port = 8303 }]`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			hcl := fmt.Sprintf("server = true\ndata_dir = %q\n%s", testutil.TempDir(t, "consul"), tc.hcl)
+			opts := LoadOpts{sources: []Source{FileSource{Name: "segments.hcl", Format: "hcl", Data: hcl}}}
+			patchLoadOptsShims(&opts)
+			result, err := Load(opts)
+			require.NoError(t, err)
+
+			var n int
+			for _, w := range result.Warnings {
+				if strings.Contains(w, `segment "alpha": clients dial`) {
+					n++
+				}
+			}
+			if tc.wantWarn {
+				require.Equal(t, 1, n, "warnings: %q", result.Warnings)
+			} else {
+				require.Zero(t, n, "warnings: %q", result.Warnings)
 			}
 		})
 	}

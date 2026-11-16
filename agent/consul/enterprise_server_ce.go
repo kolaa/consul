@@ -19,6 +19,7 @@ import (
 
 	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/serf/serf"
 
 	"github.com/hashicorp/consul/acl"
@@ -217,6 +218,38 @@ func (s *Server) setupSerfLAN(config *Config) error {
 // serfTagsBudget mirrors memberlist.MetaMaxSize: the encoded size limit for
 // the tag set carried in a serf member's metadata.
 const serfTagsBudget = 512
+
+const (
+	// SerfTagLimit is the most bytes serf accepts for a member's encoded tags;
+	// serf.Create and SetTags refuse anything larger.
+	SerfTagLimit = memberlist.MetaMaxSize
+
+	// SerfBaseTagReserve is the room kept for a server's default LAN pool tags
+	// other than sl_ and the datacenter name; TestServer_BaseLANTags_FitReserve
+	// keeps it honest.
+	SerfBaseTagReserve = 352
+)
+
+// SegmentTagSize is the number of bytes one sl_<name>=host:port tag adds to
+// the server's encoded default LAN pool tags.
+func SegmentTagSize(name, host string, port int) int {
+	key := len("sl_") + len(name)
+	value := len(net.JoinHostPort(host, strconv.Itoa(port)))
+	return msgpackStrSize(key) + msgpackStrSize(value)
+}
+
+// msgpackStrSize is the encoded size of an n-byte string in the msgpack
+// dialect serf uses (raw headers, no str8).
+func msgpackStrSize(n int) int {
+	switch {
+	case n < 32:
+		return 1 + n
+	case n < 1<<16:
+		return 3 + n
+	default:
+		return 5 + n
+	}
+}
 
 // encodedSerfTagsSize replicates serf's encodeTags so the CE tag budget
 // check measures exactly what serf.Create will.

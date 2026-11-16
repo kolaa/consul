@@ -312,3 +312,11 @@ func (s *Server) segmentFloodJoins(segment string, dstSerf *serf.Serf, state *se
 	}
 	return missing
 }
+
+// IsCloudAutoJoin reports whether a join address is a go-discover expression
+// ("provider=aws tag_key=...") rather than a host or host:port. It is the one
+// test shared by join routing and config validation, and matches the check
+// retry_join uses to resolve such entries (agent/retry_join.go).
+func IsCloudAutoJoin(addr string) bool {
+	return strings.Contains(addr, "provider=")
+}

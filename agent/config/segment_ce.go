@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/ipaddr"
 )
 
@@ -22,8 +23,20 @@ var validSegmentName = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_-]*[A-Za-z0-9])?
 
 // "local" and "remote" collide with serf/local.snapshot (LAN) and
 // serf/remote.snapshot (WAN) because segment snapshots are named
-// serf/<lower(name)>.snapshot.
-var reservedSegmentNames = map[string]struct{}{"local": {}, "remote": {}}
+// serf/<lower(name)>.snapshot. The Windows device names are reserved too:
+// on Windows serf/con.snapshot opens the console device, not a file, so the
+// segment's rejoin state would be lost.
+var reservedSegmentNames = func() map[string]struct{} {
+	names := map[string]struct{}{
+		"local": {}, "remote": {},
+		"con": {}, "prn": {}, "aux": {}, "nul": {},
+	}
+	for i := 1; i <= 9; i++ {
+		names["com"+strconv.Itoa(i)] = struct{}{}
+		names["lpt"+strconv.Itoa(i)] = struct{}{}
+	}
+	return names
+}()
 
 // ValidateSegmentName checks a segment name for blankness, length, syntax and
 // the reserved words shared by a server's segments = [...] list and a
@@ -45,6 +58,32 @@ func ValidateSegmentName(name string, limit int) error {
 }
 
 func isAny(ip net.IP) bool { return ip == nil || ip.IsUnspecified() }
+
+// segmentPortsOnly reports whether addrs is non-empty and every entry is a
+// host:port whose port belongs to a segment. Bare hosts and cloud auto-join
+// expressions reach the default LAN pool, so any of them makes it false.
+func segmentPortsOnly(addrs []string, segmentPorts map[int]string) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	for _, addr := range addrs {
+		if consul.IsCloudAutoJoin(addr) {
+			return false
+		}
+		_, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return false
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return false
+		}
+		if _, ok := segmentPorts[port]; !ok {
+			return false
+		}
+	}
+	return true
+}
 
 // BindConflict reports whether two listeners would fight over the same
 // socket: same port and either the same IP or one of them is a wildcard.
@@ -93,6 +132,35 @@ func (b *builder) validateSegments(rt RuntimeConfig) error {
 	taken := []bound{{"serf_lan", rt.SerfBindAddrLAN}, {"server (RPC)", rt.RPCBindAddr}}
 	if rt.SerfBindAddrWAN != nil {
 		taken = append(taken, bound{"serf_wan", rt.SerfBindAddrWAN})
+	}
+	// Serf binds TCP and UDP, so a client listener on either protocol
+	// collides. Unix sockets cannot; DNS lists one address per protocol, so
+	// keep one entry per IP:port to report a collision once.
+	clientAddrs := []struct {
+		owner string
+		addrs []net.Addr
+	}{
+		{"HTTP", rt.HTTPAddrs}, {"HTTPS", rt.HTTPSAddrs},
+		{"gRPC", rt.GRPCAddrs}, {"gRPC TLS", rt.GRPCTLSAddrs}, {"DNS", rt.DNSAddrs},
+	}
+	for _, c := range clientAddrs {
+		seen := make(map[string]struct{}, len(c.addrs))
+		for _, a := range c.addrs {
+			var addr *net.TCPAddr
+			switch a := a.(type) {
+			case *net.TCPAddr:
+				addr = a
+			case *net.UDPAddr:
+				addr = &net.TCPAddr{IP: a.IP, Port: a.Port, Zone: a.Zone}
+			default:
+				continue
+			}
+			if _, dup := seen[addr.String()]; dup {
+				continue
+			}
+			seen[addr.String()] = struct{}{}
+			taken = append(taken, bound{c.owner, addr})
+		}
 	}
 	names := make(map[string]string, len(rt.Segments)) // lower(name) -> name
 	ports := make(map[int]string, len(rt.Segments))    // JoinLAN routes explicit ports by number
@@ -146,6 +214,37 @@ func (b *builder) validateSegments(rt RuntimeConfig) error {
 				}
 			}
 			taken = append(taken, bound{fmt.Sprintf("segment %q rpc_listener", seg.Name), rpc})
+		} else if !isAny(rt.RPCBindAddr.IP) && !rt.RPCBindAddr.IP.Equal(seg.Advertise.IP) &&
+			(rt.RPCAdvertiseAddr == nil || !rt.RPCAdvertiseAddr.IP.Equal(seg.Advertise.IP)) {
+			// Segment clients dial the segment advertise IP on the server
+			// RPC port, which only the main RPC listener can answer. The RPC
+			// advertise IP is exempt: default-pool clients already dial it,
+			// so it reaches that listener (directly or through NAT).
+			b.warn("segment %q: clients dial %s for RPC, but the RPC listener binds %s; "+
+				"set rpc_listener = true or bind the server RPC to that IP or a wildcard",
+				seg.Name, &net.TCPAddr{IP: seg.Advertise.IP, Port: rt.ServerPort}, rt.RPCBindAddr)
+		}
+	}
+
+	// JoinLAN routes a retry_join entry with a segment port only to that
+	// segment's pool, so a server whose entries all name segment ports never
+	// joins the default LAN pool, and the flooder (which starts from the
+	// default pool) cannot repair that.
+	if rt.ServerMode && segmentPortsOnly(rt.RetryJoinLAN, ports) {
+		b.warn("every retry_join entry targets a segment port, so this server will not join the " +
+			"default LAN pool: add the servers' serf_lan address (or a bare host) to retry_join")
+	}
+
+	// Servers gossip every segment's endpoint as an sl_ tag on the default LAN
+	// pool, and serf refuses to start once the encoded tags pass its limit.
+	if rt.ServerMode {
+		need := 0
+		for _, seg := range rt.Segments {
+			need += consul.SegmentTagSize(seg.Name, seg.Advertise.IP.String(), seg.Advertise.Port)
+		}
+		if consul.SerfBaseTagReserve+len(rt.Datacenter)+need > consul.SerfTagLimit {
+			fail("%d segments need %d bytes of serf tags; serf allows %d bytes in total (%d reserved for other server tags)",
+				len(rt.Segments), need, consul.SerfTagLimit, consul.SerfBaseTagReserve+len(rt.Datacenter))
 		}
 	}
 	return errors.Join(errs...)
