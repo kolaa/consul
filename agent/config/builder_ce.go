@@ -101,15 +101,22 @@ func (*builder) validateEnterpriseConfig(rt RuntimeConfig) error {
 	// on the servers. With the default serf_lan port, a retry_join address that
 	// carries no explicit port resolves against the default LAN pool instead,
 	// so the join is rejected as a wrong-segment merge. This applies to cloud
-	// auto-join (provider=...) too: go-discover emits bare addresses with no
-	// port, which would resolve the same wrong way at join time - failing here
-	// is the only way to tell the user before the agent starts an endless
-	// retry loop.
+	// auto-join (provider=...) too: go-discover returns bare addresses with no
+	// port for most providers, which would resolve the same wrong way at join
+	// time - failing here is the only way to tell the user before the agent
+	// starts an endless retry loop. The Kubernetes provider is the exception:
+	// it honours the consul.hashicorp.com/auto-join-port pod annotation and
+	// then returns ip:port addresses, so it is allowed through (set the
+	// annotation to the segment's port).
 	for _, addr := range rt.RetryJoinLAN {
 		if strings.Contains(addr, "provider=") {
+			if strings.Contains(addr, "provider=k8s") {
+				continue
+			}
 			return fmt.Errorf("retry_join %q (cloud auto-join) cannot be used while segment = %q and ports.serf_lan "+
 				"is the default %d: discovery returns addresses with no port, which resolve to the servers' default "+
-				"LAN pool instead of the segment; use host:<segment port> or set ports.serf_lan to the segment port",
+				"LAN pool instead of the segment; use host:<segment port>, set ports.serf_lan to the segment port, "+
+				"or use provider=k8s with the consul.hashicorp.com/auto-join-port annotation set to the segment port",
 				addr, rt.SegmentName, defaultSerfLANPort)
 		}
 		if _, _, err := net.SplitHostPort(addr); err != nil {

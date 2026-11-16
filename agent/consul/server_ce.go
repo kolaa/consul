@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-metrics"
@@ -23,7 +24,9 @@ import (
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/consul/reporting"
 	resourcegrpc "github.com/hashicorp/consul/agent/grpc-external/services/resource"
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
+	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/internal/gossip/librtt"
 	"github.com/hashicorp/consul/internal/resource"
 	"github.com/hashicorp/consul/logging"
@@ -45,16 +48,40 @@ func (s *Server) enterpriseValidateJoinWAN() error {
 // JoinLAN is used to have Consul join the inner-DC pool The target address
 // should be another node inside the DC listening on the Serf LAN address.
 //
-// Only the default pool decides whether the join succeeded (P1-3):
-// retry_join treats a non-nil error as a failure and, with retry_max set,
-// exits the agent with "max join retry exhausted" - so a segment pool that
-// cannot be reached (segment port firewalled, first server of a rolling
-// upgrade not yet listening) must not fail an otherwise successful LAN
-// join. Segment pools are converged by the flooders anyway (see
-// floodSegments); explicit host:<segment port> entries are honoured
-// best-effort and only logged.
+// Only the default pool decides whether the join succeeded: retry_join
+// treats a non-nil error as a failure and, with retry_max set, exits the
+// agent with "max join retry exhausted" - so a segment pool that cannot be
+// reached (segment port firewalled, first server of a rolling upgrade not
+// yet listening) must not fail an otherwise successful LAN join. Segment
+// pools are converged by the flooders anyway (see floodSegments); explicit
+// host:<segment port> entries are honoured best-effort and only logged.
 func (s *Server) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, error) {
 	lanAddrs, segmentAddrs := segmentJoinAddrsExplicitOnly(addrs, s.config.Segments)
+
+	// Segment joins run first, in parallel: each unreachable segment address
+	// would otherwise block the next one for up to memberlist's TCPTimeout
+	// (10s), and a manual `consul join host:<segPort>` must still repair a
+	// split segment pool even when the address list has nothing for the
+	// default pool (the error below says so).
+	names := slices.Sorted(maps.Keys(segmentAddrs))
+	segErrs := make([]error, len(names))
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, segErrs[i] = s.segmentLan[name].Join(segmentAddrs[name], true)
+		}()
+	}
+	wg.Wait()
+	for i, name := range names {
+		if segErrs[i] != nil {
+			s.logger.Warn(
+				"explicit segment join failed; only the segment flooder will retry, "+
+					"against the advertised segment address",
+				"segment", name, "error", segErrs[i])
+		}
+	}
 
 	// Every address carrying a configured segment port means the default
 	// pool has nothing to join. Returning (0, nil) here would let
@@ -71,16 +98,6 @@ func (s *Server) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, erro
 	if len(lanAddrs) > 0 {
 		n, err = s.serfLAN.Join(lanAddrs, true)
 	}
-
-	// Best-effort segment joins. The sorted order keeps the WARNs
-	// deterministic (see P3); keys come from s.config.Segments, exactly like
-	// the keys of s.segmentLan.
-	for _, name := range slices.Sorted(maps.Keys(segmentAddrs)) {
-		if _, jerr := s.segmentLan[name].Join(segmentAddrs[name], true); jerr != nil {
-			s.logger.Warn("segment join failed; flood-join will retry",
-				"segment", name, "error", jerr)
-		}
-	}
 	return n, err
 }
 
@@ -94,7 +111,7 @@ func (s *Server) JoinLAN(addrs []string, entMeta *acl.EnterpriseMeta) (int, erro
 //     goes to the default pool only. Bare addresses are deliberately not
 //     expanded per segment any more: segment pools are converged by the
 //     flooders (see floodSegments), so the default pool alone decides
-//     whether a retry_join attempt succeeded (P1-3).
+//     whether a retry_join attempt succeeded.
 //
 // This assumes the (usual) deployment where every server in the datacenter is
 // configured with the same segment names and ports.
@@ -293,32 +310,217 @@ func (s *Server) DoWithLANSerfs(
 func (s *Server) reconcile() (err error) {
 	defer metrics.MeasureSince([]string{"leader", "reconcile"}, time.Now())
 
-	known := make(map[string]struct{})
-	visit := func(m serf.Member) error {
-		known[strings.ToLower(m.Name)] = struct{}{}
-		return s.reconcileMember(m)
-	}
-	for _, m := range s.serfLAN.Members() {
-		if err := visit(m); err != nil {
+	// Collapse the member views of every pool into one decision per node
+	// name: a node that shows up in several pools (a client that moved
+	// segments, a hostname reused in two segments) must be reconciled once
+	// per pass, with an alive member winning over a failed or left one, or
+	// its serfHealth flips between passing and critical on every pass.
+	members := s.lanMembersByNode()
+
+	known := make(map[string]struct{}, len(members))
+	for _, name := range slices.Sorted(maps.Keys(members)) {
+		known[strings.ToLower(name)] = struct{}{}
+
+		m := pickReconcileMember(members[name])
+		if m == nil {
+			// The same node name is alive in several pools with conflicting
+			// node IDs. Registering either view would flap the catalog, so
+			// log and touch nothing; the name stays in `known` so the entry
+			// is not reaped either.
+			s.logger.Error(
+				"node name conflict across LAN pools: the name is alive with different node IDs; refusing to reconcile it",
+				"node", name, "pools", memberPoolTags(members[name]))
+			continue
+		}
+		if err := s.reconcileMember(*m); err != nil {
 			return err
 		}
 	}
-	for _, name := range s.segmentNames() {
-		for _, m := range s.segmentLan[name].Members() {
-			if m.Tags["role"] == "consul" {
-				// Servers are reconciled from the default pool; their segment
-				// copies carry segment=<name> and would only log WARN here.
-				continue
-			}
-			if err := visit(m); err != nil {
-				return err
-			}
-		}
+
+	// A leader whose segment pools have not converged must not reap catalog
+	// nodes it simply cannot see: reaping them is what makes segment clients
+	// blink whenever leadership moves. Protect the affected nodes for this
+	// pass instead.
+	if err := s.protectUnconvergedSegments(known); err != nil {
+		return err
 	}
 
 	// Reconcile any members that have been reaped while we were not the
 	// leader.
 	return s.reconcileReaped(known, nil)
+}
+
+// lanMembersByNode gathers the members of the default pool and of every
+// segment pool, keyed by node name. Server copies in segment pools are
+// excluded: servers are reconciled from the default pool.
+func (s *Server) lanMembersByNode() map[string][]serf.Member {
+	out := make(map[string][]serf.Member)
+	for _, m := range s.serfLAN.Members() {
+		out[m.Name] = append(out[m.Name], m)
+	}
+	for _, name := range s.segmentNames() {
+		for _, m := range s.segmentLan[name].Members() {
+			if m.Tags["role"] == "consul" {
+				continue
+			}
+			out[m.Name] = append(out[m.Name], m)
+		}
+	}
+	return out
+}
+
+// pickReconcileMember chooses the single member view to reconcile for a node
+// name that appears in several pools. An alive member wins over any non-alive
+// one; several alive members with different node IDs mean the name is used by
+// different nodes in different pools, and nil is returned so the caller
+// refuses to register either view.
+func pickReconcileMember(members []serf.Member) *serf.Member {
+	alive := -1
+	aliveIDs := make(map[string]struct{})
+	for i, m := range members {
+		if m.Status != serf.StatusAlive {
+			continue
+		}
+		aliveIDs[m.Tags["id"]] = struct{}{}
+		if alive == -1 {
+			alive = i
+		}
+	}
+	if alive >= 0 {
+		if len(aliveIDs) > 1 {
+			return nil
+		}
+		return &members[alive]
+	}
+
+	// No alive view: take the least-terminal status (leaving < left < failed)
+	// so a node that moved between pools settles on one registration.
+	best := 0
+	for i := range members {
+		if members[i].Status < members[best].Status {
+			best = i
+		}
+	}
+	return &members[best]
+}
+
+// memberPoolTags describes where each member view of a conflicting node name
+// was seen, for the conflict log message.
+func memberPoolTags(members []serf.Member) []any {
+	out := make([]any, 0, len(members))
+	for _, m := range members {
+		segment := m.Tags["segment"]
+		if segment == "" {
+			segment = "default"
+		}
+		out = append(out, fmt.Sprintf("%s(status=%s id=%s)", segment, m.Status, m.Tags["id"]))
+	}
+	return out
+}
+
+// protectUnconvergedSegments adds catalog nodes that no local pool knows to
+// `known` - protecting them from reconcileReaped - while any segment pool is
+// missing servers that advertise it. Reaping such nodes is exactly what makes
+// segment clients blink on every leadership change while a pool is split or
+// still converging.
+func (s *Server) protectUnconvergedSegments(known map[string]struct{}) error {
+	unconverged := s.unconvergedSegments()
+	if len(unconverged) == 0 {
+		return nil
+	}
+
+	entMeta := structs.NodeEnterpriseMetaInDefaultPartition()
+	state := s.fsm.State()
+	_, checks, err := state.ChecksInState(nil, api.HealthAny, entMeta, structs.DefaultPeerKeyword)
+	if err != nil {
+		return err
+	}
+
+	var protected []string
+	for _, check := range checks {
+		if check.CheckID != structs.SerfCheckID {
+			continue
+		}
+		nodeName := strings.ToLower(check.Node)
+		if _, ok := known[nodeName]; ok {
+			continue
+		}
+
+		// Consul servers are reconciled from the default pool, which is not
+		// affected by a segment split; leave them to the normal reap path.
+		_, services, err := state.NodeServices(nil, check.Node, entMeta, structs.DefaultPeerKeyword)
+		if err != nil {
+			return err
+		}
+		isServer := false
+		for _, svc := range services.Services {
+			if svc.ID == structs.ConsulServiceID {
+				isServer = true
+				break
+			}
+		}
+		if isServer {
+			continue
+		}
+
+		known[nodeName] = struct{}{}
+		protected = append(protected, check.Node)
+	}
+
+	if len(protected) > 0 {
+		slices.Sort(protected)
+		s.logger.Warn(
+			"segment pools have not converged; skipping the reap of nodes that no local pool can see, to keep segment clients from blinking in the catalog",
+			"unconverged_segments", unconverged, "protected_nodes", protected)
+		metrics.SetGaugeWithLabels(
+			[]string{"leader", "reconcile", "reap_blocked"},
+			1,
+			[]metrics.Label{{Name: "segment", Value: strings.Join(unconverged, ",")}},
+		)
+	}
+	return nil
+}
+
+// unconvergedSegments lists the segments whose local pool is missing at least
+// one alive default-LAN server that advertises the segment via its
+// sl_<segment> tag. Servers without the tag (for example while a new segment
+// is being rolled out) are not required.
+func (s *Server) unconvergedSegments() []string {
+	required := make(map[string]map[string]struct{})
+	for _, m := range s.serfLAN.Members() {
+		if m.Status != serf.StatusAlive {
+			continue
+		}
+		ok, server := metadata.IsConsulServer(m)
+		if !ok {
+			continue
+		}
+		for segment := range server.SegmentAddrs {
+			set := required[segment]
+			if set == nil {
+				set = make(map[string]struct{})
+				required[segment] = set
+			}
+			set[server.Name] = struct{}{}
+		}
+	}
+
+	var unconverged []string
+	for _, name := range s.segmentNames() {
+		seen := make(map[string]struct{})
+		for _, m := range s.segmentLan[name].Members() {
+			if m.Status == serf.StatusAlive {
+				seen[m.Name] = struct{}{}
+			}
+		}
+		for serverName := range required[name] {
+			if _, ok := seen[serverName]; !ok {
+				unconverged = append(unconverged, name)
+				break
+			}
+		}
+	}
+	return unconverged
 }
 
 func (s *Server) addEnterpriseStats(stats map[string]map[string]string) {

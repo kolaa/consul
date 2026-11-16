@@ -6,14 +6,18 @@
 package consul
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/go-msgpack/v2/codec"
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/serf/serf"
 
@@ -31,12 +35,67 @@ var (
 type EnterpriseServer struct {
 	segmentLan       map[string]*serf.Serf
 	segmentListeners map[string]net.Listener
+
+	// tagSizeErr records a clear error when the serf tags assembled for the
+	// default LAN pool exceed memberlist's encoded-tag budget, so that
+	// setupSerfLAN can fail startup with the segment names instead of the
+	// opaque error serf.Create would return.
+	tagSizeErr error
 }
 
 func (s *Server) initEnterprise(_ Deps) error {
 
 	s.segmentLan = make(map[string]*serf.Serf, len(s.config.Segments))
 	s.segmentListeners = make(map[string]net.Listener, len(s.config.Segments))
+
+	// Publish each segment's dialable gossip address as an sl_<name> tag on
+	// the default LAN pool. Peers build their flood-join address from these
+	// tags, so a segment that lives on its own NIC/VLAN converges even though
+	// its address differs from the LAN address. Servers without the tag (for
+	// example while a new segment is being rolled out) are skipped by the
+	// flooder instead of being dialed at a guessed address.
+	if len(s.config.Segments) > 0 && s.config.SerfLANConfig != nil {
+		if s.config.SerfLANConfig.Tags == nil {
+			s.config.SerfLANConfig.Tags = make(map[string]string, len(s.config.Segments))
+		}
+		for _, segment := range s.config.Segments {
+			if segment.SerfConfig == nil {
+				continue
+			}
+			mc := segment.SerfConfig.MemberlistConfig
+			host := mc.AdvertiseAddr
+			if host == "" {
+				host = mc.BindAddr
+			}
+			port := mc.AdvertisePort
+			if port <= 0 {
+				port = mc.BindPort
+			}
+			s.config.SerfLANConfig.Tags["sl_"+segment.Name] = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+	}
+
+	// Measure the fully assembled tag set of the default LAN pool (this hook
+	// runs at the end of setupSerfConfig, after every built-in tag and the
+	// published sl_<segment> tags are in place) and remember a clear error if
+	// it does not fit memberlist's budget. Segment pools publish no sl_ tags,
+	// and the WAN pool cannot, so only the default pool is measured.
+	prev := s.config.OverrideInitialSerfTags
+	s.config.OverrideInitialSerfTags = func(tags map[string]string) {
+		if prev != nil {
+			prev(tags)
+		}
+		if tags["segment"] != "" {
+			return
+		}
+		if size := encodedSerfTagsSize(tags); size > serfTagsBudget {
+			s.tagSizeErr = fmt.Errorf(
+				"serf tags for the default LAN pool encode to %d bytes, over the %d-byte limit: "+
+					"the sl_<segment> tags published for network segments leave too little room; "+
+					"shorten segment names/advertise addresses or reduce the segment count",
+				size, serfTagsBudget)
+		}
+	}
 
 	return nil
 }
@@ -142,9 +201,33 @@ func (s *Server) setupSerfLAN(config *Config) error {
 		Partition:    "",
 	})
 	if err != nil {
+		// serf.Create rejects an oversized tag set with a generic message;
+		// the tag budget check in initEnterprise names the actual cause.
+		if s.tagSizeErr != nil {
+			return s.tagSizeErr
+		}
 		return err
 	}
+	if s.tagSizeErr != nil {
+		return s.tagSizeErr
+	}
 	return nil
+}
+
+// serfTagsBudget mirrors memberlist.MetaMaxSize: the encoded size limit for
+// the tag set carried in a serf member's metadata.
+const serfTagsBudget = 512
+
+// encodedSerfTagsSize replicates serf's encodeTags so the CE tag budget
+// check measures exactly what serf.Create will.
+func encodedSerfTagsSize(tags map[string]string) int {
+	var buf bytes.Buffer
+	buf.WriteByte(255) // serf tagMagicByte
+	enc := codec.NewEncoder(&buf, &codec.MsgpackHandle{})
+	if err := enc.Encode(tags); err != nil {
+		return len(buf.Bytes()) + 1 // unreachable for a string map; treat as over budget
+	}
+	return buf.Len()
 }
 
 func (s *Server) shutdownSerfLAN() {

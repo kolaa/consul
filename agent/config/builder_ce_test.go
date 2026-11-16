@@ -201,6 +201,13 @@ func TestValidateEnterpriseConfig_SegmentClientRetryJoin(t *testing.T) {
 			},
 			wantErr: "cannot be used",
 		},
+		"kubernetes auto-join is allowed: it honours the auto-join-port annotation": {
+			rt: RuntimeConfig{
+				SegmentName:  "alpha",
+				SerfPortLAN:  8301,
+				RetryJoinLAN: []string{"provider=k8s label_selector=\"app=consul,component=server\""},
+			},
+		},
 		"cloud auto-join with ports.serf_lan overridden is accepted": {
 			rt: RuntimeConfig{
 				SegmentName:  "alpha",
