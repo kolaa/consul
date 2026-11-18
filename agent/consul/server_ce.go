@@ -23,6 +23,7 @@ import (
 
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/consul/reporting"
+	"github.com/hashicorp/consul/agent/consul/state"
 	resourcegrpc "github.com/hashicorp/consul/agent/grpc-external/services/resource"
 	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
@@ -332,6 +333,9 @@ func (s *Server) reconcile() (err error) {
 				"node", name, "pools", memberPoolTags(members[name]))
 			continue
 		}
+		if m.Status == serf.StatusAlive {
+			s.recordNodeSegment(*m)
+		}
 		if err := s.reconcileMember(*m); err != nil {
 			return err
 		}
@@ -418,14 +422,262 @@ func memberPoolTags(members []serf.Member) []any {
 	return out
 }
 
+// poolEventFilter forwards the LAN pools' serf events to eventChLAN, dropping
+// events that a cross-pool view proves stale. Without it the leader's
+// event-driven reconcile (which sees one pool's view) marks a moved agent
+// critical when the old pool's copy fails, and deregisters it by name once
+// the old copy is reaped - the exact blinking the periodic pass deduplicates.
+//
+// The filter decides from current membership, not from the order events
+// arrive in: pools deliver from different goroutines, and a graceful move can
+// deliver the new pool's join and the old pool's leave in any order.
+func (s *Server) poolEventFilter() {
+	for {
+		select {
+		case e := <-s.poolEventCh:
+			if me, ok := e.(serf.MemberEvent); ok {
+				me.Members = s.filterShadowedMembers(me)
+				if len(me.Members) == 0 {
+					continue
+				}
+				e = me
+			}
+			select {
+			case s.eventChLAN <- e:
+			case <-s.shutdownCh:
+				return
+			}
+		case <-s.shutdownCh:
+			return
+		}
+	}
+}
+
+// filterShadowedMembers drops the members of one event whose view the
+// cross-pool state proves stale, and records where every alive client lives
+// for the reap guard. Server members always flow through: every pool holds a
+// copy of every server, so filtering them could drop a real failure, and
+// moved/duplicate hostnames are a client problem.
+func (s *Server) filterShadowedMembers(me serf.MemberEvent) []serf.Member {
+	// alive indexes, per LAN pool ("": the default pool), the node IDs alive
+	// there. A member's own pool is its segment tag, so an event can be
+	// judged against the OTHER pools.
+	alive := s.aliveClientIndex()
+
+	out := make([]serf.Member, 0, len(me.Members))
+	for _, m := range me.Members {
+		s.recordNodeSegment(m)
+
+		if m.Tags["role"] == "consul" {
+			out = append(out, m)
+			continue
+		}
+
+		key := strings.ToLower(m.Name)
+		ownPool := m.Tags["segment"]
+		switch me.Type {
+		case serf.EventMemberJoin, serf.EventMemberUpdate:
+			// The same name alive with a DIFFERENT node ID in ANOTHER pool is
+			// a duplicate hostname; registering either view flips the catalog
+			// entry, so drop it and count it. The member's own pool is
+			// expected to hold it alive with its own ID.
+			conflicted := false
+			for pool, ids := range alive[key] {
+				if pool == ownPool {
+					continue
+				}
+				if _, ok := ids[m.Tags["id"]]; !ok && len(ids) > 0 {
+					conflicted = true
+					break
+				}
+			}
+			if m.Status == serf.StatusAlive && conflicted {
+				metrics.IncrCounterWithLabels(
+					[]string{"leader", "reconcile", "name_conflict"},
+					1,
+					[]metrics.Label{{Name: "segment", Value: m.Tags["segment"]}},
+				)
+				s.logger.Error(
+					"node name conflict across LAN pools: the name is alive with different node IDs; dropping the event",
+					"node", m.Name, "segment", m.Tags["segment"], "id", m.Tags["id"])
+				continue
+			}
+		default:
+			// failed, left, reap, leaving: drop the event when ANY pool holds
+			// the same node (same ID) alive - it moved to another pool, or
+			// the event is older than the node's current liveness.
+			shadowed := false
+			for _, ids := range alive[key] {
+				if _, ok := ids[m.Tags["id"]]; ok {
+					shadowed = true
+					break
+				}
+			}
+			if shadowed {
+				s.logger.Debug(
+					"dropping member event shadowed by a live copy in a LAN pool",
+					"node", m.Name, "status", memberStatusString(m.Status), "id", m.Tags["id"])
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// memberStatusString renders a member status without panicking on the
+// synthetic StatusReap value, whose String() serf does not handle.
+func memberStatusString(status serf.MemberStatus) string {
+	if status == StatusReap {
+		return "reap"
+	}
+	return status.String()
+}
+
+// aliveClientIndex maps, per LAN pool ("" is the default pool), lowercased
+// client names to the node IDs alive there. Server copies are excluded.
+func (s *Server) aliveClientIndex() map[string]map[string]map[string]struct{} {
+	out := make(map[string]map[string]map[string]struct{})
+	index := func(pool string, members []serf.Member) {
+		for _, m := range members {
+			if m.Status != serf.StatusAlive || m.Tags["role"] == "consul" {
+				continue
+			}
+			key := strings.ToLower(m.Name)
+			byPool := out[key]
+			if byPool == nil {
+				byPool = make(map[string]map[string]struct{})
+				out[key] = byPool
+			}
+			ids := byPool[pool]
+			if ids == nil {
+				ids = make(map[string]struct{})
+				byPool[pool] = ids
+			}
+			ids[m.Tags["id"]] = struct{}{}
+		}
+	}
+	// Guard against the startup window: the filter goroutine starts in
+	// initEnterprise, while the segment pools are created before the default
+	// LAN pool, so an event can arrive before serfLAN exists.
+	if s.serfLAN != nil {
+		index("", s.serfLAN.Members())
+	}
+	for _, name := range s.segmentNames() {
+		if pool := s.segmentLan[name]; pool != nil {
+			index(name, pool.Members())
+		}
+	}
+	return out
+}
+
+// recordNodeSegment remembers, per lowercased client name, the segment of the
+// pool the node was last seen alive in. It backs the reap guard's scoping for
+// catalog nodes that carry no segment meta.
+func (s *Server) recordNodeSegment(m serf.Member) {
+	if m.Tags["role"] == "consul" || m.Status != serf.StatusAlive {
+		return
+	}
+	s.segmentMu.Lock()
+	defer s.segmentMu.Unlock()
+	s.nodeSegments[strings.ToLower(m.Name)] = m.Tags["segment"]
+}
+
+// lastKnownSegment returns the segment a node was last seen alive in, for the
+// reap guard's scoping when the catalog entry has no segment meta.
+func (s *Server) lastKnownSegment(lowerName string) (string, bool) {
+	s.segmentMu.Lock()
+	defer s.segmentMu.Unlock()
+	segment, ok := s.nodeSegments[lowerName]
+	return segment, ok
+}
+
 // protectUnconvergedSegments adds catalog nodes that no local pool knows to
-// `known` - protecting them from reconcileReaped - while any segment pool is
-// missing servers that advertise it. Reaping such nodes is exactly what makes
-// segment clients blink on every leadership change while a pool is split or
-// still converging.
+// `known` - protecting them from reconcileReaped - but only while the segment
+// they belong to is unconverged on this server. Reaping such nodes is what
+// makes segment clients blink on every leadership change while a pool is
+// split. Nodes of converged segments and of the default pool keep the normal
+// reap path, and protection for a segment ends after ReconnectTimeoutLAN of
+// continuous non-convergence, so a permanent misconfiguration cannot keep
+// ghosts forever.
 func (s *Server) protectUnconvergedSegments(known map[string]struct{}) error {
-	unconverged := s.unconvergedSegments()
-	if len(unconverged) == 0 {
+	now := time.Now()
+	lanMembers := s.serfLAN.Members()
+
+	// seen reports, per segment this server knows about (configured pools
+	// plus segments other servers advertise), whether its pool holds every
+	// required server.
+	seen := make(map[string]bool, len(s.segmentLan))
+	for _, name := range s.segmentNames() {
+		seen[name] = s.segmentPoolConverged(name, lanMembers)
+	}
+	for name := range advertisedSegments(s.config.Datacenter, lanMembers) {
+		if _, ok := seen[name]; !ok {
+			// Another server runs a segment this one has no pool for.
+			seen[name] = false
+		}
+	}
+
+	// Per-segment observability on every pass: one series per segment, back
+	// to 0 when converged, plus an ERROR once per episode after
+	// ReconnectTimeoutLAN of continuous non-convergence: the leader is then
+	// long-term blind to that segment and the nodes it protects may be dead
+	// without anyone noticing.
+	for name, ok := range seen {
+		var v float32
+		if !ok {
+			v = 1
+		}
+		metrics.SetGaugeWithLabels(
+			[]string{"leader", "reconcile", "segment_unconverged"},
+			v,
+			[]metrics.Label{{Name: "segment", Value: name}},
+		)
+		if ok {
+			s.clearUnseenSince(name)
+			continue
+		}
+		age, started := s.unseenSinceAge(name, now)
+		if !started {
+			s.markUnseenSince(name, now)
+			continue
+		}
+		if age > s.reapGuardTimeout() && !s.capLoggedOnce(name) {
+			s.logger.Error(
+				"segment pool has not converged for an extended period; "+
+					"segment clients may be invisible to this leader and their health checks stale",
+				"segment", name, "unconverged_for", age)
+		}
+	}
+
+	// protect is the set of segments whose unknown nodes are guarded this
+	// pass; the time-capped segments resume the normal reap path.
+	protect := make(map[string]struct{})
+	for name := range seen {
+		if seen[name] {
+			continue
+		}
+		if age, ok := s.unseenSinceAge(name, now); ok && age > s.reapGuardTimeout() {
+			continue
+		}
+		protect[name] = struct{}{}
+	}
+
+	// reap_blocked: one series per configured segment, 1 only while nodes of
+	// that segment are actually guarded.
+	for _, name := range s.segmentNames() {
+		var v float32
+		if _, ok := protect[name]; ok {
+			v = 1
+		}
+		metrics.SetGaugeWithLabels(
+			[]string{"leader", "reconcile", "reap_blocked"},
+			v,
+			[]metrics.Label{{Name: "segment", Value: name}},
+		)
+	}
+
+	if len(protect) == 0 {
 		return nil
 	}
 
@@ -443,6 +695,17 @@ func (s *Server) protectUnconvergedSegments(known map[string]struct{}) error {
 		}
 		nodeName := strings.ToLower(check.Node)
 		if _, ok := known[nodeName]; ok {
+			continue
+		}
+
+		// Scope the guard to the node's segment: the catalog meta when it
+		// records one, this server's last observation otherwise. A node this
+		// server cannot place keeps the normal reap path.
+		segment, hasInfo := s.nodeSegmentOf(state, check.Node, nodeName, entMeta)
+		if !hasInfo {
+			continue
+		}
+		if _, guard := protect[segment]; !guard {
 			continue
 		}
 
@@ -469,25 +732,111 @@ func (s *Server) protectUnconvergedSegments(known map[string]struct{}) error {
 
 	if len(protected) > 0 {
 		slices.Sort(protected)
+		segments := slices.Sorted(maps.Keys(protect))
 		s.logger.Warn(
 			"segment pools have not converged; skipping the reap of nodes that no local pool can see, to keep segment clients from blinking in the catalog",
-			"unconverged_segments", unconverged, "protected_nodes", protected)
-		metrics.SetGaugeWithLabels(
-			[]string{"leader", "reconcile", "reap_blocked"},
-			1,
-			[]metrics.Label{{Name: "segment", Value: strings.Join(unconverged, ",")}},
-		)
+			"unconverged_segments", segments, "protected_nodes", protected)
 	}
 	return nil
 }
 
-// unconvergedSegments lists the segments whose local pool is missing at least
-// one alive default-LAN server that advertises the segment via its
-// sl_<segment> tag. Servers without the tag (for example while a new segment
-// is being rolled out) are not required.
-func (s *Server) unconvergedSegments() []string {
-	required := make(map[string]map[string]struct{})
-	for _, m := range s.serfLAN.Members() {
+// reapGuardTimeout is how long a segment may stay unconverged before the
+// reap guard stops protecting its nodes and the ERROR goes out. It follows
+// the LAN reconnect timeout: serf keeps a failed member that long, so a node
+// invisible to this leader longer than that is a ghost, not a blink.
+func (s *Server) reapGuardTimeout() time.Duration {
+	if s.config.SerfLANConfig != nil && s.config.SerfLANConfig.ReconnectTimeout > 0 {
+		return s.config.SerfLANConfig.ReconnectTimeout
+	}
+	return 72 * time.Hour
+}
+
+// unseenSinceAge returns how long the segment has been recorded as
+// unconverged, and whether it is recorded at all.
+func (s *Server) unseenSinceAge(name string, now time.Time) (time.Duration, bool) {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	since, ok := s.unseenSince[name]
+	if !ok {
+		return 0, false
+	}
+	return now.Sub(since), true
+}
+
+// markUnseenSince records the segment as unconverged, unless it already is.
+func (s *Server) markUnseenSince(name string, now time.Time) {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	if _, ok := s.unseenSince[name]; !ok {
+		s.unseenSince[name] = now
+	}
+}
+
+// clearUnseenSince forgets the unconverged state of a converged segment.
+func (s *Server) clearUnseenSince(name string) {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	delete(s.unseenSince, name)
+	delete(s.segmentCapLogged, name)
+}
+
+// capLoggedOnce reports whether the extended-outage ERROR went out for the
+// current episode, and records that it has when it had not.
+func (s *Server) capLoggedOnce(name string) bool {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	if s.segmentCapLogged[name] {
+		return true
+	}
+	s.segmentCapLogged[name] = true
+	return false
+}
+
+// resetCapLogged re-arms the extended-outage ERROR for tests.
+func (s *Server) resetCapLogged(name string) {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	delete(s.segmentCapLogged, name)
+}
+
+// setUnseenSince records the segment as unconverged since t (tests).
+func (s *Server) setUnseenSince(name string, since time.Time) {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	s.unseenSince[name] = since
+}
+
+// nodeSegmentOf resolves which segment a catalog node belongs to: the catalog
+// meta when it records one, this server's last observation otherwise.
+func (s *Server) nodeSegmentOf(stateStore *state.Store, node, lowerName string, entMeta *acl.EnterpriseMeta) (string, bool) {
+	_, n, err := stateStore.GetNode(node, entMeta, structs.DefaultPeerKeyword)
+	if err == nil && n != nil {
+		if segment, ok := n.Meta[structs.MetaSegmentKey]; ok {
+			return segment, true
+		}
+	}
+	return s.lastKnownSegment(lowerName)
+}
+
+// segmentPoolConverged reports whether the local pool of `segment` holds an
+// alive copy of every required server: one that advertises the segment via
+// its sl_ tag, or that publishes no tag and is reached through the LAN-IP
+// fallback. A server whose fallback join was refused does not run the
+// segment, so it is not required.
+func (s *Server) segmentPoolConverged(segment string, lanMembers []serf.Member) bool {
+	var refused map[string]struct{}
+	if st := s.floodState[segment]; st != nil {
+		refused = st.refusedNames()
+	}
+
+	alive := make(map[string]struct{})
+	for _, m := range s.segmentLan[segment].Members() {
+		if m.Status == serf.StatusAlive {
+			alive[strings.ToLower(m.Name)] = struct{}{}
+		}
+	}
+
+	for _, m := range lanMembers {
 		if m.Status != serf.StatusAlive {
 			continue
 		}
@@ -495,32 +844,36 @@ func (s *Server) unconvergedSegments() []string {
 		if !ok {
 			continue
 		}
-		for segment := range server.SegmentAddrs {
-			set := required[segment]
-			if set == nil {
-				set = make(map[string]struct{})
-				required[segment] = set
+		if _, advertised := server.SegmentAddrs[segment]; !advertised {
+			if _, skip := refused[strings.ToLower(server.Name)]; skip {
+				continue
 			}
-			set[server.Name] = struct{}{}
+		}
+		if _, ok := alive[strings.ToLower(server.Name)]; !ok {
+			return false
 		}
 	}
+	return true
+}
 
-	var unconverged []string
-	for _, name := range s.segmentNames() {
-		seen := make(map[string]struct{})
-		for _, m := range s.segmentLan[name].Members() {
-			if m.Status == serf.StatusAlive {
-				seen[m.Name] = struct{}{}
-			}
+// advertisedSegments returns the segments that alive servers of the
+// datacenter advertise in the default LAN pool through their sl_<name> tags.
+// A segment nobody advertises has been removed from every running server.
+func advertisedSegments(datacenter string, lanMembers []serf.Member) map[string]struct{} {
+	segments := make(map[string]struct{})
+	for _, m := range lanMembers {
+		if m.Status != serf.StatusAlive {
+			continue
 		}
-		for serverName := range required[name] {
-			if _, ok := seen[serverName]; !ok {
-				unconverged = append(unconverged, name)
-				break
-			}
+		ok, srv := metadata.IsConsulServer(m)
+		if !ok || srv.Datacenter != datacenter {
+			continue
+		}
+		for name := range srv.SegmentAddrs {
+			segments[name] = struct{}{}
 		}
 	}
-	return unconverged
+	return segments
 }
 
 func (s *Server) addEnterpriseStats(stats map[string]map[string]string) {

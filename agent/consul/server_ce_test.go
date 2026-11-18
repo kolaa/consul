@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,11 +20,13 @@ import (
 	"github.com/hashicorp/serf/serf"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/testrpc"
+	"github.com/hashicorp/consul/types"
 )
 
 func TestSegmentJoinAddrsExplicitOnly(t *testing.T) {
@@ -704,81 +705,160 @@ func TestServer_JoinLAN_SegmentOnlyAddrsIsAnError(t *testing.T) {
 		"an address that cannot reach the default pool must not report success")
 }
 
-// segmentFloodPlan must build the join list from the advertised sl_<segment>
-// tags: a server that does not advertise the segment is skipped without any
-// dialing, an already-alive server is not re-joined, and member names are
-// compared exactly, so a node named "node1.dc1" in datacenter "dc1" does not
-// produce an endless re-join against its own pool copy.
-func TestSegmentFloodPlan(t *testing.T) {
-	serverMember := func(name, segment, addr string, port int) serf.Member {
-		tags := map[string]string{
-			"role": "consul", "dc": "dc1", "id": "id-" + name,
-			"port": "8300", "vsn": "5", "build": "1.20.0",
-		}
-		if segment != "" {
-			tags["sl_"+segment] = net.JoinHostPort(addr, strconv.Itoa(port))
-		}
-		return serf.Member{Name: name, Addr: net.ParseIP(addr), Port: uint16(port), Status: serf.StatusAlive, Tags: tags}
+// segmentFloodTarget must prefer the advertised sl_<segment> address and
+// fall back to the LAN IP plus the local segment port when the server
+// publishes no tag (same-IP segments omit their tag to save tag budget).
+func TestSegmentFloodTarget(t *testing.T) {
+	srv := &metadata.Server{
+		Name:         "node1",
+		Addr:         &net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 8300},
+		SegmentAddrs: map[string]string{"dmz": "172.16.0.5"},
+		SegmentPorts: map[string]int{"dmz": 8310},
 	}
 
-	t.Run("server without the segment tag is skipped entirely", func(t *testing.T) {
-		lan := []serf.Member{
-			serverMember("s1", "alpha", "10.0.0.1", 8303),
-			serverMember("s2", "", "10.0.0.2", 0), // no alpha
-		}
-		// s1 is a member of its own alpha pool; only s2 would need a join if
-		// it had the segment.
-		seg := []serf.Member{serverMember("s1", "alpha", "10.0.0.1", 8303)}
-		targets, missing := segmentFloodPlan("alpha", lan, seg)
-		require.Empty(t, targets)
-		require.Empty(t, missing,
-			"a server without the segment tag must not be dialed or counted as missing")
-	})
+	addr, advertised := segmentFloodTarget(srv, "dmz", 8303)
+	require.True(t, advertised)
+	require.Equal(t, "172.16.0.5:8310", addr,
+		"the advertised tag address must win over the fallback")
 
-	t.Run("alive servers are not re-joined and exact names match", func(t *testing.T) {
-		// s1's node name ends in ".dc1" while the datacenter is "dc1": the
-		// WAN flooder's TrimSuffix comparison would re-join it forever.
-		lan := []serf.Member{serverMember("consul01.dc1", "alpha", "10.0.0.1", 8303)}
-		seg := []serf.Member{serverMember("consul01.dc1", "alpha", "10.0.0.1", 8303)}
-		targets, missing := segmentFloodPlan("alpha", lan, seg)
-		require.Empty(t, targets, "an alive pool copy must not be flood-joined again")
-		require.Empty(t, missing)
-	})
+	addr, advertised = segmentFloodTarget(srv, "alpha", 8303)
+	require.False(t, advertised)
+	require.Equal(t, "10.0.0.5:8303", addr,
+		"a tag-less server is dialed at the LAN IP plus the local segment port")
 
-	t.Run("advertised but missing server is a join target", func(t *testing.T) {
-		lan := []serf.Member{serverMember("s1", "alpha", "172.16.0.1", 8303)}
-		targets, missing := segmentFloodPlan("alpha", lan, nil)
-		require.Equal(t, []string{"s1"}, missing)
-		require.Len(t, targets, 1)
-		require.Equal(t, "172.16.0.1", targets[0].SegmentAddrs["alpha"],
-			"the join address must come from the advertised tag, not the LAN address")
-		require.Equal(t, 8303, targets[0].SegmentPorts["alpha"])
-	})
+	srv.Addr = nil
+	_, advertised = segmentFloodTarget(srv, "alpha", 8303)
+	require.False(t, advertised, "a server without any address must not be dialed")
 }
 
-// A server that stays unreachable after a join attempt must be backed off
-// instead of being re-joined every pass.
-func TestSegmentFloodState_FlapBackoff(t *testing.T) {
+// The retry state must back failures off exponentially, skip refused
+// fallbacks, and reset a server that became alive.
+func TestSegmentFloodState_TimeBackoff(t *testing.T) {
 	st := newSegmentFloodState()
+	st.baseDelay = time.Second
+	st.maxDelay = 8 * time.Second
+	now := time.Now()
 
-	// First pass: join attempt, marked pending.
-	require.False(t, st.joinedRecently("s1"))
-	st.markPending("s1")
+	require.True(t, st.due("s1", now), "a server never dialed is due")
 
-	// Next pass: still missing -> flapping -> backoff, no join attempt.
-	require.True(t, st.joinedRecently("s1"))
-	st.setBackoff("s1", segmentFlapBackoffPasses)
+	st.reschedule("s1", now)
+	require.False(t, st.due("s1", now.Add(500*time.Millisecond)))
+	require.True(t, st.due("s1", now.Add(time.Second)), "first retry after the base delay")
 
-	// Backed off passes do not attempt joins.
-	for i := 0; i < segmentFlapBackoffPasses; i++ {
-		require.True(t, st.takeBackoff("s1"), "pass %d must stay backed off", i)
-	}
-	require.False(t, st.takeBackoff("s1"), "backoff must be exhausted after its passes")
+	st.reschedule("s1", now.Add(time.Second))
+	require.False(t, st.due("s1", now.Add(2*time.Second)))
+	require.True(t, st.due("s1", now.Add(3*time.Second)), "backoff doubles per attempt")
 
-	// A server that became alive is reset.
+	// Refused fallbacks are skipped by the flooder and by the reap guard.
+	st.markRefused("s2")
+	require.True(t, st.refusedFallback("s2"))
+	require.Contains(t, st.refusedNames(), "s2")
+
+	// A server that became alive is fully reset.
+	st.reschedule("s1", now.Add(3*time.Second))
 	st.clear("s1")
-	require.False(t, st.joinedRecently("s1"))
-	require.False(t, st.takeBackoff("s1"))
+	require.True(t, st.due("s1", now.Add(4*time.Second)))
+	st.markRefused("s2")
+	st.clear("s2")
+	require.False(t, st.refusedFallback("s2"))
+	require.Empty(t, st.refusedNames())
+}
+
+// The cross-pool event filter must drop a non-alive event whose node is
+// alive with the same ID in another pool (a moved agent), keep events for
+// nodes that are really gone, and drop alive events whose name is alive
+// with a different node ID elsewhere (a duplicate hostname).
+func TestServer_PoolEventFilter_ShadowedMembers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+	t.Parallel()
+
+	logs := &lockedBuffer{}
+	segPort := freeport.GetOne(t)
+	_, s := testServerWithDepsAndConfig(t, func(d *Deps) {
+		d.Logger = hclog.NewInterceptLogger(&hclog.LoggerOptions{
+			Output: logs,
+			Level:  hclog.Error,
+		})
+	}, func(c *Config) {
+		c.Segments = []NetworkSegment{segmentForTest("alpha", segPort)}
+	})
+	defer s.Shutdown()
+
+	// web-7 moved to alpha: its old (default pool) copy is failed.
+	_, web7 := testClientWithConfig(t, func(c *Config) {
+		c.NodeName = uniqueNodeName(t.Name()) + "-web7"
+		c.NodeID = types.NodeID(uniqueNodeName(t.Name()) + "-web7")
+		c.Segment = "alpha"
+	})
+	defer web7.Shutdown()
+	joinLAN(t, web7, s)
+
+	// web-9 exists twice with different node IDs: once in the default pool,
+	// once in alpha.
+	_, web9Default := testClientWithConfig(t, func(c *Config) {
+		c.NodeName = uniqueNodeName(t.Name()) + "-web9"
+		c.NodeID = types.NodeID(uniqueNodeName(t.Name()) + "-web9d")
+	})
+	defer web9Default.Shutdown()
+	joinLAN(t, web9Default, s)
+
+	_, web9Alpha := testClientWithConfig(t, func(c *Config) {
+		c.NodeName = web9Default.config.NodeName
+		c.NodeID = types.NodeID(uniqueNodeName(t.Name()) + "-web9a")
+		c.Segment = "alpha"
+	})
+	defer web9Alpha.Shutdown()
+	joinLAN(t, web9Alpha, s)
+
+	// Wait until every client is where the test expects it.
+	retry.Run(t, func(r *retry.R) {
+		alpha, err := s.LANMembers(LANMemberFilter{Segment: "alpha"})
+		require.NoError(r, err)
+		require.Len(r, alpha, 3, "alpha pool: server + web-7 + web-9")
+	})
+
+	idOf := func(c *Client) string { return string(c.config.NodeID) }
+
+	// 1. A failed event for web-7 from its old pool is shadowed by the live
+	// alpha copy with the same ID.
+	failedWeb7 := serf.Member{
+		Name:   web7.config.NodeName,
+		Status: serf.StatusFailed,
+		Tags:   map[string]string{"role": "node", "segment": "", "id": idOf(web7)},
+	}
+	kept := s.filterShadowedMembers(serf.MemberEvent{
+		Type:    serf.EventMemberFailed,
+		Members: []serf.Member{failedWeb7},
+	})
+	require.Empty(t, kept, "a failed event shadowed by a live copy in another pool must be dropped")
+
+	// 2. A failed event for a node no pool holds alive flows through.
+	ghost := serf.Member{
+		Name:   "ghost-" + uniqueNodeName(t.Name()),
+		Status: serf.StatusFailed,
+		Tags:   map[string]string{"role": "node", "segment": "", "id": "id-ghost"},
+	}
+	kept = s.filterShadowedMembers(serf.MemberEvent{
+		Type:    serf.EventMemberFailed,
+		Members: []serf.Member{ghost},
+	})
+	require.Len(t, kept, 1, "a real failure must flow through")
+
+	// 3. An alive event for web-9 is dropped: another pool holds the same
+	// name with a different live node.
+	aliveWeb9 := serf.Member{
+		Name:   web9Default.config.NodeName,
+		Status: serf.StatusAlive,
+		Tags:   map[string]string{"role": "node", "segment": "", "id": idOf(web9Default)},
+	}
+	kept = s.filterShadowedMembers(serf.MemberEvent{
+		Type:    serf.EventMemberJoin,
+		Members: []serf.Member{aliveWeb9},
+	})
+	require.Empty(t, kept, "an alive event for a name conflicted across pools must be dropped")
+	require.Contains(t, logs.String(), "node name conflict across LAN pools")
 }
 
 // The regression the advertised sl_<segment> tags exist for: the segment
@@ -879,29 +959,37 @@ func TestPickReconcileMember(t *testing.T) {
 	})
 }
 
-// The sl_<segment> tags count against serf's 512-byte tag budget; a config
-// that does not fit must fail startup with an error naming the cause, not
-// serf's generic "Encoded length of tags exceeds limit".
-func TestServer_SegmentTagBudgetExceeded(t *testing.T) {
+// Segments reachable at the LAN advertise IP must NOT spend serf's tag
+// budget: their sl_ tags are omitted and the flooder's LAN-IP fallback
+// covers them. Only a segment on a different address publishes a tag.
+func TestServer_SegmentTags_OmittedForSameIP(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 	t.Parallel()
 
-	// 64-char names (the maximum) make each sl_ tag ~100 bytes; eight of
-	// them plus the built-in tags blow past 512 bytes.
-	longName := strings.Repeat("s", 64)
-	segments := make([]NetworkSegment, 0, 8)
-	for i := 0; i < 8; i++ {
-		segments = append(segments, segmentForTest(fmt.Sprintf("%s%02d", longName, i), freeport.GetOne(t)))
-	}
+	skipIfCannotBindToIP(t, "127.0.0.2")
 
-	_, config := testServerConfig(t)
-	config.Segments = segments
-	_, err := newServer(t, config)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "serf tags for the default LAN pool encode to",
-		"startup must fail with the segment-aware tag budget error")
+	sameIPPort := freeport.GetOne(t)
+	otherIPPort := freeport.GetOne(t)
+
+	other := segmentForTest("dmz", otherIPPort)
+	other.SerfConfig.MemberlistConfig.BindAddr = "127.0.0.2"
+	other.SerfConfig.MemberlistConfig.AdvertiseAddr = "127.0.0.2"
+
+	_, s := testServerWithConfig(t, func(c *Config) {
+		c.Segments = []NetworkSegment{
+			segmentForTest("alpha", sameIPPort), // same IP as the LAN pool
+			other,                               // separate NIC
+		}
+	})
+	defer s.Shutdown()
+
+	tags := s.serfLAN.LocalMember().Tags
+	require.NotContains(t, tags, "sl_alpha",
+		"a segment reachable at the LAN IP must not spend tag budget")
+	require.Equal(t, net.JoinHostPort("127.0.0.2", strconv.Itoa(otherIPPort)), tags["sl_dmz"],
+		"a segment on another address must be advertised")
 }
 
 // A leader whose segment pool has not converged must not reap catalog nodes
@@ -931,6 +1019,7 @@ func TestServer_Reconcile_SkipsReapWhileSegmentUnconverged(t *testing.T) {
 		c.Bootstrap = true
 		c.SerfFloodInterval = time.Hour
 		seg := segmentForTest("alpha", segPort)
+		seg.SerfConfig.MemberlistConfig.AdvertiseAddr = "127.0.0.2"
 		seg.SerfConfig.MemberlistConfig.AdvertisePort = 1
 		c.Segments = []NetworkSegment{seg}
 	})
@@ -943,6 +1032,7 @@ func TestServer_Reconcile_SkipsReapWhileSegmentUnconverged(t *testing.T) {
 		c.Bootstrap = false
 		c.SerfFloodInterval = time.Hour
 		seg := segmentForTest("alpha", freeport.GetOne(t))
+		seg.SerfConfig.MemberlistConfig.AdvertiseAddr = "127.0.0.2"
 		seg.SerfConfig.MemberlistConfig.AdvertisePort = 1
 		c.Segments = []NetworkSegment{seg}
 	})
@@ -954,10 +1044,13 @@ func TestServer_Reconcile_SkipsReapWhileSegmentUnconverged(t *testing.T) {
 
 	// Register a catalog node with a serfHealth check that no local pool
 	// knows about - exactly the state a split pool leaves segment clients in.
+	// The segment meta is what real clients register (agent.go) and what
+	// scopes the reap guard to alpha.
 	ghost := structs.RegisterRequest{
 		Datacenter: s1.config.Datacenter,
 		Node:       "ghost",
 		Address:    "127.1.1.1",
+		NodeMeta:   map[string]string{structs.MetaSegmentKey: "alpha"},
 		Check: &structs.HealthCheck{
 			Node:    "ghost",
 			CheckID: structs.SerfCheckID,
@@ -976,7 +1069,8 @@ func TestServer_Reconcile_SkipsReapWhileSegmentUnconverged(t *testing.T) {
 		require.Len(r, members, 2)
 	})
 
-	require.NotEmpty(t, s1.unconvergedSegments(), "alpha must be unconverged on s1 before the first reconcile")
+	require.False(t, s1.segmentPoolConverged("alpha", s1.serfLAN.Members()),
+		"alpha must be unconverged on s1 before the first reconcile")
 
 	require.NoError(t, s1.reconcile())
 
@@ -1003,4 +1097,150 @@ func TestServer_Reconcile_SkipsReapWhileSegmentUnconverged(t *testing.T) {
 	_, node, err = s1.fsm.State().GetNode("ghost", nil, "")
 	require.NoError(t, err)
 	require.Nil(t, node, "once the segment pool converged, the ghost node must be reaped")
+}
+
+// splitAlphaCluster starts a two-server cluster whose alpha pools cannot
+// converge: both servers advertise alpha at a dead 127.0.0.2 address, and
+// neither alpha bind address is reachable from the other side, so no
+// flood join can merge the pools (a serf join merges both directions at
+// once). s1 is the leader.
+func splitAlphaCluster(t *testing.T, depOpts func(*Deps)) (*Server, *Server) {
+	skipIfCannotBindToIP(t, "127.0.0.2")
+
+	dead := func(c *Config, bootstrap bool) {
+		c.Bootstrap = bootstrap
+		c.SerfFloodInterval = time.Hour
+		seg := segmentForTest("alpha", freeport.GetOne(t))
+		seg.SerfConfig.MemberlistConfig.AdvertiseAddr = "127.0.0.2"
+		seg.SerfConfig.MemberlistConfig.AdvertisePort = 1
+		c.Segments = []NetworkSegment{seg}
+	}
+	_, s1 := testServerWithDepsAndConfig(t, depOpts, func(c *Config) { dead(c, true) })
+	_, s2 := testServerWithConfig(t, func(c *Config) { dead(c, false) })
+	joinLAN(t, s2, s1)
+
+	retry.Run(t, func(r *retry.R) {
+		members, err := s1.LANMembers(LANMemberFilter{})
+		require.NoError(r, err)
+		require.Len(r, members, 2, "s1 must see s2 in the default pool")
+	})
+	require.False(t, s1.segmentPoolConverged("alpha", s1.serfLAN.Members()),
+		"alpha must be unconverged on the leader")
+	return s1, s2
+}
+
+// After the guard's time cap (ReconnectTimeoutLAN of continuous
+// non-convergence), a segment's unknown nodes must be reaped again: a
+// permanent split must not keep ghosts forever, and the extended outage must
+// be logged once as an ERROR.
+func TestServer_Reconcile_ReapGuardTimeCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+	t.Parallel()
+
+	logs := &lockedBuffer{}
+	s1, s2 := splitAlphaCluster(t, func(d *Deps) {
+		d.Logger = hclog.NewInterceptLogger(&hclog.LoggerOptions{
+			Output: logs,
+			Level:  hclog.Error,
+		})
+	})
+	defer s1.Shutdown()
+	defer s2.Shutdown()
+
+	// A short cap keeps the test fast.
+	s1.config.SerfLANConfig.ReconnectTimeout = 500 * time.Millisecond
+
+	// A dead segment client the leader cannot see, registered in the catalog
+	// with segment meta so the guard scopes to alpha.
+	ghost := structs.RegisterRequest{
+		Datacenter: s1.config.Datacenter,
+		Node:       "ghost",
+		Address:    "127.1.1.1",
+		NodeMeta:   map[string]string{structs.MetaSegmentKey: "alpha"},
+		Check: &structs.HealthCheck{
+			Node:    "ghost",
+			CheckID: structs.SerfCheckID,
+			Name:    structs.SerfCheckName,
+			Status:  api.HealthCritical,
+		},
+	}
+	var out struct{}
+	require.NoError(t, s1.RPC(context.Background(), "Catalog.Register", &ghost, &out))
+
+	// While the segment is freshly unconverged, the ghost is protected.
+	s1.setUnseenSince("alpha", time.Now())
+	require.NoError(t, s1.reconcile())
+	_, node, err := s1.fsm.State().GetNode("ghost", nil, "")
+	require.NoError(t, err)
+	require.NotNil(t, node, "inside the time cap the ghost must be protected")
+
+	// Past the cap the ghost is reaped and the outage logged once.
+	s1.setUnseenSince("alpha", time.Now().Add(-time.Hour))
+	s1.resetCapLogged("alpha")
+	require.NoError(t, s1.reconcile())
+	_, node, err = s1.fsm.State().GetNode("ghost", nil, "")
+	require.NoError(t, err)
+	require.Nil(t, node, "past the time cap the ghost must be reaped")
+	require.Contains(t, logs.String(), "segment pool has not converged for an extended period")
+}
+
+// The reap guard only protects nodes of the UNCONVERGED segment: a ghost of
+// the default pool is reaped even while a segment pool is split.
+func TestServer_Reconcile_ReapGuardScopedToSegment(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+	t.Parallel()
+
+	s1, s2 := splitAlphaCluster(t, nil)
+	defer s1.Shutdown()
+	defer s2.Shutdown()
+
+	register := func(name, segment string) {
+		req := structs.RegisterRequest{
+			Datacenter: s1.config.Datacenter,
+			Node:       name,
+			Address:    "127.1.1.1",
+			Check: &structs.HealthCheck{
+				Node:    name,
+				CheckID: structs.SerfCheckID,
+				Name:    structs.SerfCheckName,
+				Status:  api.HealthCritical,
+			},
+		}
+		if segment != "" {
+			req.NodeMeta = map[string]string{structs.MetaSegmentKey: segment}
+		}
+		var out struct{}
+		require.NoError(t, s1.RPC(context.Background(), "Catalog.Register", &req, &out))
+	}
+	register("seg-ghost", "alpha")
+	register("default-ghost", "")
+
+	s1.setUnseenSince("alpha", time.Now())
+	require.NoError(t, s1.reconcile())
+
+	_, node, err := s1.fsm.State().GetNode("seg-ghost", nil, "")
+	require.NoError(t, err)
+	require.NotNil(t, node, "a node of the unconverged segment is protected")
+
+	_, node, err = s1.fsm.State().GetNode("default-ghost", nil, "")
+	require.NoError(t, err)
+	require.Nil(t, node, "a default-pool node must keep the normal reap path")
+}
+
+// IsCloudAutoJoin must match go-discover expressions exactly: the provider
+// key must be the first key, so hosts that merely contain "provider=" are
+// routed to serf instead of the discover path.
+func TestIsCloudAutoJoin(t *testing.T) {
+	require.True(t, IsCloudAutoJoin("provider=aws tag_key=consul"))
+	require.True(t, IsCloudAutoJoin("provider=k8s label_selector=app:consul"))
+	require.False(t, IsCloudAutoJoin("10.0.0.1"))
+	require.False(t, IsCloudAutoJoin("10.0.0.1:8301"))
+	require.False(t, IsCloudAutoJoin("provider-aware-host"))     // no "=" after the key
+	require.False(t, IsCloudAutoJoin("host=x provider=aws"))     // provider not first
+	require.False(t, IsCloudAutoJoin("provider="))               // empty provider value
+	require.False(t, IsCloudAutoJoin("xprovider=aws tag_key=k")) // key is not exactly "provider"
 }

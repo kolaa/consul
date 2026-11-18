@@ -235,16 +235,27 @@ func (b *builder) validateSegments(rt RuntimeConfig) error {
 			"default LAN pool: add the servers' serf_lan address (or a bare host) to retry_join")
 	}
 
-	// Servers gossip every segment's endpoint as an sl_ tag on the default LAN
-	// pool, and serf refuses to start once the encoded tags pass its limit.
+	// Servers gossip the endpoint of every segment that is NOT reachable at
+	// the LAN address as an sl_ tag on the default LAN pool, and serf refuses
+	// to start once the encoded tags pass its limit. The check keeps
+	// SerfTagHeadroom free below the limit so a future Consul release can add
+	// built-in tags without every server refusing to start after an upgrade.
 	if rt.ServerMode {
+		lanAdvertise := rt.SerfAdvertiseAddrLAN
+		if lanAdvertise == nil {
+			lanAdvertise = rt.SerfBindAddrLAN
+		}
 		need := 0
 		for _, seg := range rt.Segments {
+			if lanAdvertise != nil && seg.Advertise.IP.Equal(lanAdvertise.IP) {
+				continue // reachable through the LAN-IP fallback: no tag published
+			}
 			need += consul.SegmentTagSize(seg.Name, seg.Advertise.IP.String(), seg.Advertise.Port)
 		}
-		if consul.SerfBaseTagReserve+len(rt.Datacenter)+need > consul.SerfTagLimit {
-			fail("%d segments need %d bytes of serf tags; serf allows %d bytes in total (%d reserved for other server tags)",
-				len(rt.Segments), need, consul.SerfTagLimit, consul.SerfBaseTagReserve+len(rt.Datacenter))
+		if used := consul.SerfBaseTagReserve + len(rt.Datacenter) + need; used > consul.SerfTagLimit-consul.SerfTagHeadroom {
+			fail("%d segments need %d bytes of serf tags; the limit with headroom is %d bytes (%d reserved for other server tags, %d kept free for future releases)",
+				len(rt.Segments), need, consul.SerfTagLimit-consul.SerfTagHeadroom,
+				consul.SerfBaseTagReserve+len(rt.Datacenter), consul.SerfTagHeadroom)
 		}
 	}
 	return errors.Join(errs...)
