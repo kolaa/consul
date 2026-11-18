@@ -131,6 +131,38 @@ func TestValidateSegments(t *testing.T) {
 				segmentCase("beta", 8304),
 			),
 		},
+		"tag budget fits within the headroom": {
+			rt: segmentValidationFixture(
+				segmentCase("alpha", 8303),
+				segmentCase("beta", 8304),
+				segmentCase("gamma", 8305),
+				segmentCase("delta", 8306),
+			),
+		},
+		"tag budget exceeded": {
+			rt: segmentValidationFixture(
+				segmentCase("alpha", 8303),
+				segmentCase("beta", 8304),
+				segmentCase("gamma", 8305),
+				segmentCase("delta", 8306),
+				segmentCase("echo", 8307),
+			),
+			wantErrs: []string{"the limit with headroom is 448 bytes"},
+		},
+		"segments reachable at the LAN IP do not spend tag budget": {
+			rt: func() RuntimeConfig {
+				segs := make([]structs.NetworkSegment, 0, 12)
+				names := []string{"s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s10", "s11", "s12"}
+				for i, name := range names {
+					segs = append(segs, structs.NetworkSegment{
+						Name:      name,
+						Bind:      segTCPAddr("127.0.0.1", 8310+i),
+						Advertise: segTCPAddr("127.0.0.1", 8310+i), // == LAN bind IP: tag omitted
+					})
+				}
+				return segmentValidationFixture(segs...)
+			}(),
+		},
 		"single character segment name is valid": {
 			rt: segmentValidationFixture(segmentCase("a", 8303)),
 		},
@@ -374,7 +406,7 @@ func TestValidateSegments(t *testing.T) {
 				rt.Datacenter = "dc1"
 				return rt
 			}(),
-			wantErrs: []string{`20 segments need`, `serf allows 512 bytes`},
+			wantErrs: []string{`20 segments need`, `the limit with headroom is 448 bytes`},
 		},
 		"small segment set fits the serf tag budget": {
 			rt: func() RuntimeConfig {

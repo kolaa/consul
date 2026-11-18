@@ -67,6 +67,28 @@ func (s *Server) setupSerf(opts setupSerfOptions) (*serf.Serf, *serf.Config, err
 	return cluster, conf, nil
 }
 
+// validateWANBindPort rejects a WAN serf pool configured with a dynamic (0)
+// bind port. Consul creates the WAN memberlist transport itself (the mesh
+// gateway federation transport wraps it), so memberlist never gets the chance
+// to write an auto-bound port back into the config: BindPort would stay 0 and
+// the dynamic-port check in NewServer would fail there anyway.
+//
+// Running the check here, before setupSerf creates anything, means no socket
+// is ever bound just to be torn down again (and a machine with a restricted
+// ephemeral port range can't fail that bind first with an unrelated error).
+// The error still comes back through setupSerf, so NewServer takes its
+// ordinary error path: s.Shutdown() runs and releases everything registered
+// so far, including the segment RPC listeners created by setupSegmentRPC.
+//
+// It lives in this untagged file next to its caller so both community and
+// enterprise builds get it (review finding F12).
+func validateWANBindPort(conf *serf.Config) error {
+	if conf.MemberlistConfig.BindPort == 0 {
+		return errors.New("Failed to get dynamic bind port for WAN Serf")
+	}
+	return nil
+}
+
 func (s *Server) setupSerfConfig(opts setupSerfOptions) (*serf.Config, error) {
 	if opts.Config == nil {
 		return nil, errors.New("serf config is a required field")
@@ -316,6 +338,15 @@ func (s *Server) localMemberEvent(me serf.MemberEvent) {
 
 	// Queue the members for reconciliation
 	for _, m := range me.Members {
+		// Apply the same filter the periodic reconcile applies via
+		// shouldHandleMember: a server's copy in a segment pool has a
+		// non-empty segment tag and is never handled there, so queueing it
+		// only logs a WARN per segment per server on the leader for every
+		// flood join, failure and update (review finding F9).
+		if m.Tags["role"] == "consul" && m.Tags["segment"] != "" {
+			continue
+		}
+
 		// Change the status if this is a reap event
 		if isReap {
 			m.Status = StatusReap

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-metrics"
 	"github.com/hashicorp/go-metrics/prometheus"
 	"github.com/hashicorp/serf/serf"
@@ -71,7 +72,7 @@ func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Liste
 
 		ln, _, err := s.setupSerf(setupSerfOptions{
 			Config:       segment.SerfConfig,
-			EventCh:      s.eventChLAN,
+			EventCh:      s.poolEventCh,
 			SnapshotPath: fmt.Sprintf("serf/%s.snapshot", strings.ToLower(segment.Name)),
 			Listener:     listener,
 			WAN:          false,
@@ -95,92 +96,103 @@ func (s *Server) setupSegments(config *Config, rpcListeners map[string]net.Liste
 // retry_join took: a bare address, an explicit host:port, or none at all.
 //
 // The join address is the server's own advertised segment address, published
-// as an sl_<segment> tag on the default LAN pool, so a segment that lives on
-// its own NIC/VLAN converges even though its address differs from the LAN
-// address. Servers without the tag (for example while a new segment is being
-// rolled out server-by-server) are skipped without dialing anything.
+// as an sl_<segment> tag on the default LAN pool - but only when the segment
+// is not reachable at the LAN advertise IP (see initEnterprise). For a
+// tag-less server the flooder falls back to the LAN IP plus the segment
+// port; a refused connection there means the server does not run the
+// segment, so it is skipped quietly from then on.
 func (s *Server) floodSegments(config *Config) {
+	if len(config.Segments) > 0 {
+		// Forward the pooled events to eventChLAN. The pools buffered their
+		// events since setupSegments; the filter drains the backlog on start
+		// (a single channel keeps each pool's order).
+		go s.poolEventFilter()
+	}
 	for _, sc := range config.Segments {
-		go s.segmentFloodLoop(sc.Name, s.segmentLan[sc.Name], s.config.SerfFloodInterval)
+		_, port := segmentAdvertiseHostPort(sc)
+		flooder := &segmentFlooder{
+			logger:  s.logger,
+			segment: sc.Name,
+			port:    port,
+			state:   s.floodState[sc.Name],
+		}
+		pool := s.segmentLan[sc.Name]
+		warner := &segmentFloodWarner{}
+		warned := false
+		go s.segmentFloodLoop(pool, func() {
+			now := time.Now()
+			missing := flooder.pass(s.config.Datacenter, s.serfLAN, pool, now)
+			metrics.SetGaugeWithLabels(
+				[]string{"serf", "flood", "segment_missing_servers"},
+				float32(len(missing)),
+				[]metrics.Label{{Name: "segment", Value: flooder.segment}},
+			)
+
+			if warner.observe(len(missing) > 0, now) {
+				s.logger.Warn(
+					"segment pool has not converged: some servers are missing "+
+						"(unreachable, or refusing connections); clients of this segment "+
+						"may blink in the catalog until it converges",
+					"segment", flooder.segment, "missing_servers", missing)
+				warned = true
+			} else if warned && len(missing) == 0 {
+				s.logger.Info("segment pool converged", "segment", flooder.segment)
+				warned = false
+			}
+		})
 	}
 }
 
-// segmentFlapBackoffPasses is how many flood intervals a server that stays
-// unreachable after a flood-join attempt is skipped before the next attempt.
-// A server whose segment port passes TCP but drops UDP (a common firewall
-// mistake) would otherwise be resurrected by every pass and flap between
-// alive and failed for every client of the segment.
-const segmentFlapBackoffPasses = 5
+// segmentFloodWarnInterval rate-limits the warning for servers the segment
+// flooder keeps failing to join; every attempt still logs at Debug.
+const segmentFloodWarnInterval = 5 * time.Minute
 
-// segmentFloodState tracks, per server, how the previous flood passes went.
-type segmentFloodState struct {
-	mu       sync.Mutex
-	cooldown map[string]int  // passes to skip before the next join attempt
-	pending  map[string]bool // joined on the previous pass; watch if it stays missing
+// segmentFloodWarnAfter is how many flood passes in a row must fail before
+// the flooder warns: a peer that is still starting fails a pass or two.
+const segmentFloodWarnAfter = 3
+
+// segmentFloodWarner decides when one segment's flooder reports servers it
+// cannot join. It is only touched by that segment's flood goroutine.
+type segmentFloodWarner struct {
+	fails   int
+	limiter warnLimiter
 }
 
-func newSegmentFloodState() *segmentFloodState {
-	return &segmentFloodState{
-		cooldown: make(map[string]int),
-		pending:  make(map[string]bool),
+// observe records one flood pass and reports whether to warn about it: the
+// failure has lasted segmentFloodWarnAfter passes in a row and no warning
+// went out within segmentFloodWarnInterval.
+func (w *segmentFloodWarner) observe(failed bool, now time.Time) bool {
+	if !failed {
+		w.fails = 0
+		return false
 	}
+	w.fails++
+	return w.fails >= segmentFloodWarnAfter && w.limiter.allow(now, segmentFloodWarnInterval)
 }
 
-// clear forgets any backoff for a server that is alive in the segment pool.
-func (st *segmentFloodState) clear(name string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	delete(st.cooldown, name)
-	delete(st.pending, name)
+// warnLimiter lets a repeating condition warn at most once per interval. The
+// zero value is ready to use and allows the first warning.
+type warnLimiter struct {
+	mu   sync.Mutex
+	last time.Time
 }
 
-// joinedRecently reports whether the given server was joined on the previous
-// pass, consuming the marker.
-func (st *segmentFloodState) joinedRecently(name string) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.pending[name] {
-		st.pending[name] = false
-		return true
+// allow reports whether a warning may go out at now, and records it if so.
+func (w *warnLimiter) allow(now time.Time, every time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.last.IsZero() && now.Sub(w.last) < every {
+		return false
 	}
-	return false
+	w.last = now
+	return true
 }
 
-// setBackoff skips the next n passes for the given server.
-func (st *segmentFloodState) setBackoff(name string, n int) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.cooldown[name] = n
-}
-
-// takeBackoff consumes one backoff pass; it returns true while the server is
-// still backed off.
-func (st *segmentFloodState) takeBackoff(name string) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.cooldown[name] > 0 {
-		st.cooldown[name]--
-		return true
-	}
-	return false
-}
-
-// markPending records that the given server was joined just now, so the next
-// pass can tell "joined and still missing" (flapping) apart from "never
-// tried".
-func (st *segmentFloodState) markPending(name string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.pending[name] = true
-}
-
-// segmentFloodLoop is the long-running per-segment convergence loop. Unlike
-// Flood (the LAN→WAN flooder), member names are compared exactly: LAN pool
-// member names carry no datacenter suffix, so a node named "consul01.prod"
-// in datacenter "prod" must not be flood-joined forever.
-func (s *Server) segmentFloodLoop(segment string, dstSerf *serf.Serf, interval time.Duration) {
-	// Register in floodCh so FloodNotify wakes the loop on LAN joins, the
-	// same way it wakes the WAN flooder.
+// segmentFloodLoop runs the pass on every flood interval and on every
+// FloodNotify until the default LAN pool or the segment pool shuts down. It
+// mirrors Flood (the LAN→WAN flooder); the pass is the segment joiner with
+// its exact name matching and retry backoff.
+func (s *Server) segmentFloodLoop(dstSerf *serf.Serf, pass func()) {
 	s.floodLock.Lock()
 	floodCh := make(chan struct{})
 	s.floodCh = append(s.floodCh, floodCh)
@@ -198,11 +210,8 @@ func (s *Server) segmentFloodLoop(segment string, dstSerf *serf.Serf, interval t
 		panic("flood channels out of sync")
 	}()
 
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(s.config.SerfFloodInterval)
 	defer ticker.Stop()
-
-	state := newSegmentFloodState()
-	warned := false
 	for {
 		select {
 		case <-s.serfLAN.ShutdownCh():
@@ -215,108 +224,215 @@ func (s *Server) segmentFloodLoop(segment string, dstSerf *serf.Serf, interval t
 		case <-floodCh:
 		}
 
-		missing := s.segmentFloodJoins(segment, dstSerf, state)
-		metrics.SetGaugeWithLabels(
-			[]string{"serf", "flood", "segment_missing_servers"},
-			float32(len(missing)),
-			[]metrics.Label{{Name: "segment", Value: segment}},
-		)
-
-		if len(missing) > 0 {
-			if !warned {
-				s.logger.Warn(
-					"segment pool has not converged: some servers are missing or flapping "+
-						"(reachable over TCP but failing UDP probes?); clients of this segment "+
-						"may blink in the catalog until it converges",
-					"segment", segment, "missing_servers", missing)
-				warned = true
-			}
-		} else if warned {
-			s.logger.Info("segment pool converged", "segment", segment)
-			warned = false
-		}
+		pass()
 	}
 }
 
-// segmentFloodPlan decides which servers one flood pass must try to join
-// into the segment pool: alive default-LAN servers that advertise the segment
-// but are not alive in its pool. It is a pure function so the convergence
-// logic can be unit-tested without serf instances. `missing` lists every
-// advertised server that is not alive in the pool (including ones the caller
-// may back off from joining); `targets` is the subset due a join attempt.
-func segmentFloodPlan(segment string, lanMembers, segmentMembers []serf.Member) (targets []metadata.Server, missing []string) {
-	// Names are compared exactly: LAN pool member names carry no datacenter
-	// suffix, so a node named "consul01.prod" in datacenter "prod" matches
-	// its own pool copy instead of being flood-joined forever.
+const (
+	// segmentFloodRetryBase is the first retry delay after a failed or
+	// ineffective flood join; segmentFloodRetryMax caps the exponential
+	// growth. A join that keeps "succeeding" over TCP while the member
+	// never becomes alive (UDP filtered) is backed off the same way, so the
+	// flooder cannot resurrect a half-reachable server every interval.
+	segmentFloodRetryBase = 30 * time.Second
+	segmentFloodRetryMax  = 10 * time.Minute
+)
+
+// segmentFloodState tracks, per default-pool server, when the flooder may
+// dial it again and whether a fallback join was refused (which means the
+// server does not run the segment). The flooder's goroutine and the leader's
+// reconcile loop (which reads the refused set) both touch it.
+type segmentFloodState struct {
+	mu          sync.Mutex
+	nextAttempt map[string]time.Time
+	retries     map[string]int  // consecutive attempts while the server stays missing
+	refused     map[string]bool // fallback join was refused: server does not run the segment
+
+	baseDelay time.Duration
+	maxDelay  time.Duration
+}
+
+func newSegmentFloodState() *segmentFloodState {
+	return &segmentFloodState{
+		nextAttempt: make(map[string]time.Time),
+		retries:     make(map[string]int),
+		refused:     make(map[string]bool),
+		baseDelay:   segmentFloodRetryBase,
+		maxDelay:    segmentFloodRetryMax,
+	}
+}
+
+// clear forgets all state for a server that is alive in the segment pool.
+func (st *segmentFloodState) clear(name string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.nextAttempt, name)
+	delete(st.retries, name)
+	delete(st.refused, name)
+}
+
+// due reports whether the server may be dialed at now.
+func (st *segmentFloodState) due(name string, now time.Time) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	next, ok := st.nextAttempt[name]
+	return !ok || !now.Before(next)
+}
+
+// reschedule sets the next attempt after one just happened, backing off
+// exponentially while the server stays missing.
+func (st *segmentFloodState) reschedule(name string, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delay := st.baseDelay << st.retries[name]
+	if delay > st.maxDelay || delay <= 0 {
+		delay = st.maxDelay
+	}
+	st.retries[name]++
+	st.nextAttempt[name] = now.Add(delay)
+}
+
+// markRefused records that the server's fallback join was refused.
+func (st *segmentFloodState) markRefused(name string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.refused[name] = true
+	delete(st.nextAttempt, name)
+	delete(st.retries, name)
+}
+
+// refusedFallback reports whether the server's fallback join was refused, so
+// the flooder skips it and the reap guard stops expecting it in the pool.
+func (st *segmentFloodState) refusedFallback(name string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.refused[name]
+}
+
+// refusedNames returns the names of every server whose fallback join was
+// refused. The reap guard excludes them from the servers a converged pool
+// must contain.
+func (st *segmentFloodState) refusedNames() map[string]struct{} {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make(map[string]struct{}, len(st.refused))
+	for name := range st.refused {
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+// segmentFlooder joins the default pool's servers into one segment pool.
+type segmentFlooder struct {
+	logger  hclog.Logger
+	segment string
+	port    int // this server's configured port for the segment (fallback)
+	state   *segmentFloodState
+}
+
+// segmentFloodTarget returns the address to dial for a server: the advertised
+// sl_<segment> address when the server publishes one, and the LAN IP plus
+// the local segment port otherwise.
+func segmentFloodTarget(srv *metadata.Server, segment string, fallbackPort int) (string, bool) {
+	if host, ok := srv.SegmentAddrs[segment]; ok {
+		return net.JoinHostPort(host, strconv.Itoa(srv.SegmentPorts[segment])), true
+	}
+	tcpAddr, ok := srv.Addr.(*net.TCPAddr)
+	if !ok || tcpAddr == nil || tcpAddr.IP == nil {
+		return "", false
+	}
+	return net.JoinHostPort(tcpAddr.IP.String(), strconv.Itoa(fallbackPort)), false
+}
+
+// segmentFloodCandidates performs the selection half of a flood pass: it
+// returns the servers alive in the segment pool (keyed by exact member name,
+// so the flooder can clear their retry state) and the LAN pool servers that
+// are alive there but missing from the segment pool. Member names are
+// compared exactly: LAN pool member names carry no datacenter suffix, so a
+// node named "consul01.prod" in datacenter "prod" must not be matched against
+// a suffix-trimmed "consul01" and flood-joined forever.
+func segmentFloodCandidates(datacenter string, lanMembers, segmentMembers []serf.Member) (map[string]struct{}, []metadata.Server) {
 	alive := make(map[string]struct{})
 	for _, m := range segmentMembers {
-		if m.Status == serf.StatusAlive {
-			alive[m.Name] = struct{}{}
+		if m.Status != serf.StatusAlive {
+			continue
+		}
+		if ok, srv := metadata.IsConsulServer(m); ok && srv.Datacenter == datacenter {
+			alive[srv.Name] = struct{}{}
 		}
 	}
 
+	var candidates []metadata.Server
 	for _, m := range lanMembers {
 		if m.Status != serf.StatusAlive {
 			continue
 		}
-		ok, server := metadata.IsConsulServer(m)
+		ok, srv := metadata.IsConsulServer(m)
 		if !ok {
 			continue
 		}
-		if _, hasSegment := server.SegmentAddrs[segment]; !hasSegment {
-			// The server does not run this segment (for example during the
-			// rolling addition of a new one); never dial a guessed address.
+		if _, ok := alive[srv.Name]; ok {
 			continue
 		}
-		if _, ok := alive[server.Name]; ok {
-			continue
-		}
-		missing = append(missing, server.Name)
-		targets = append(targets, *server)
+		candidates = append(candidates, *srv)
 	}
-	return targets, missing
+	return alive, candidates
 }
 
-// segmentFloodJoins performs one flood pass: it joins the planned servers
-// into the segment pool and returns the names of the advertised servers that
-// are still not alive there.
-func (s *Server) segmentFloodJoins(segment string, dstSerf *serf.Serf, state *segmentFloodState) []string {
-	lanMembers := s.serfLAN.Members()
-	segmentMembers := dstSerf.Members()
-
-	targets, missing := segmentFloodPlan(segment, lanMembers, segmentMembers)
-
-	for _, m := range segmentMembers {
-		if m.Status == serf.StatusAlive {
-			state.clear(m.Name)
-		}
+// pass performs one flood pass and returns the servers that advertise (or
+// should serve) this segment but are not alive in its pool. Refused
+// fallbacks are skipped silently; servers inside their retry backoff are
+// reported but not dialed. Candidate selection lives in
+// segmentFloodCandidates; this half owns the join side and its retry state.
+func (f *segmentFlooder) pass(datacenter string, srcSerf, dstSerf *serf.Serf, now time.Time) (missing []string) {
+	alive, candidates := segmentFloodCandidates(datacenter, srcSerf.Members(), dstSerf.Members())
+	for name := range alive {
+		f.state.clear(name)
 	}
 
-	for _, server := range targets {
-		if state.joinedRecently(server.Name) {
-			// Joined on the previous pass and still not alive: it is
-			// flapping. Back off instead of resurrecting it every interval.
-			state.setBackoff(server.Name, segmentFlapBackoffPasses)
-			continue
-		}
-		if state.takeBackoff(server.Name) {
+	for i := range candidates {
+		srv := &candidates[i]
+		if f.state.refusedFallback(srv.Name) {
 			continue
 		}
 
-		state.markPending(server.Name)
-		joinAddr := net.JoinHostPort(server.SegmentAddrs[segment], strconv.Itoa(server.SegmentPorts[segment]))
-		if _, err := dstSerf.Join([]string{server.Name + "/" + joinAddr}, true); err != nil {
-			s.logger.Debug("segment flood-join failed", "segment", segment, "server", server.Name, "address", joinAddr, "error", err)
-			state.setBackoff(server.Name, 1)
+		missing = append(missing, srv.Name)
+		if !f.state.due(srv.Name, now) {
+			continue
+		}
+
+		joinAddr, advertised := segmentFloodTarget(srv, f.segment, f.port)
+		f.state.reschedule(srv.Name, now)
+		if _, err := dstSerf.Join([]string{srv.Name + "/" + joinAddr}, true); err != nil {
+			f.logger.Debug("segment flood-join failed", "segment", f.segment, "server", srv.Name, "address", joinAddr, "error", err)
+			if !advertised && isConnectionRefused(err) {
+				// Nothing listens at the fallback address: the server does
+				// not run this segment. Skip it quietly instead of warning
+				// about a port that was never opened.
+				f.state.markRefused(srv.Name)
+				missing = missing[:len(missing)-1]
+			}
 		}
 	}
 	return missing
 }
 
+// isConnectionRefused reports whether err is a refused TCP connection.
+// memberlist formats join errors without wrapping, so the errno cannot be
+// recovered with errors.Is; the message is checked instead ("connection
+// refused" on unix, "actively refused it" on Windows).
+func isConnectionRefused(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "refused")
+}
+
 // IsCloudAutoJoin reports whether a join address is a go-discover expression
 // ("provider=aws tag_key=...") rather than a host or host:port. It is the one
 // test shared by join routing and config validation, and matches the check
-// retry_join uses to resolve such entries (agent/retry_join.go).
+// retry_join uses to resolve such entries (agent/retry_join.go). The
+// provider key must be the first key of the expression, matched exactly, so
+// hosts that merely contain "provider=" are not misclassified.
 func IsCloudAutoJoin(addr string) bool {
-	return strings.Contains(addr, "provider=")
+	first, _, _ := strings.Cut(addr, " ")
+	key, value, ok := strings.Cut(first, "=")
+	return ok && key == "provider" && value != ""
 }
