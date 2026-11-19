@@ -344,25 +344,26 @@ func segmentFloodTarget(srv *metadata.Server, segment string, fallbackPort int) 
 	return net.JoinHostPort(tcpAddr.IP.String(), strconv.Itoa(fallbackPort)), false
 }
 
-// pass performs one flood pass and returns the servers that advertise (or
-// should serve) this segment but are not alive in its pool. Refused
-// fallbacks are skipped silently; servers inside their retry backoff are
-// reported but not dialed. Member names are compared exactly: LAN pool
-// member names carry no datacenter suffix, so a node named "consul01.prod"
-// in datacenter "prod" must not be flood-joined forever.
-func (f *segmentFlooder) pass(datacenter string, srcSerf, dstSerf *serf.Serf, now time.Time) (missing []string) {
+// segmentFloodCandidates performs the selection half of a flood pass: it
+// returns the servers alive in the segment pool (keyed by exact member name,
+// so the flooder can clear their retry state) and the LAN pool servers that
+// are alive there but missing from the segment pool. Member names are
+// compared exactly: LAN pool member names carry no datacenter suffix, so a
+// node named "consul01.prod" in datacenter "prod" must not be matched against
+// a suffix-trimmed "consul01" and flood-joined forever.
+func segmentFloodCandidates(datacenter string, lanMembers, segmentMembers []serf.Member) (map[string]struct{}, []metadata.Server) {
 	alive := make(map[string]struct{})
-	for _, m := range dstSerf.Members() {
+	for _, m := range segmentMembers {
 		if m.Status != serf.StatusAlive {
 			continue
 		}
 		if ok, srv := metadata.IsConsulServer(m); ok && srv.Datacenter == datacenter {
 			alive[srv.Name] = struct{}{}
-			f.state.clear(srv.Name)
 		}
 	}
 
-	for _, m := range srcSerf.Members() {
+	var candidates []metadata.Server
+	for _, m := range lanMembers {
 		if m.Status != serf.StatusAlive {
 			continue
 		}
@@ -373,6 +374,24 @@ func (f *segmentFlooder) pass(datacenter string, srcSerf, dstSerf *serf.Serf, no
 		if _, ok := alive[srv.Name]; ok {
 			continue
 		}
+		candidates = append(candidates, *srv)
+	}
+	return alive, candidates
+}
+
+// pass performs one flood pass and returns the servers that advertise (or
+// should serve) this segment but are not alive in its pool. Refused
+// fallbacks are skipped silently; servers inside their retry backoff are
+// reported but not dialed. Candidate selection lives in
+// segmentFloodCandidates; this half owns the join side and its retry state.
+func (f *segmentFlooder) pass(datacenter string, srcSerf, dstSerf *serf.Serf, now time.Time) (missing []string) {
+	alive, candidates := segmentFloodCandidates(datacenter, srcSerf.Members(), dstSerf.Members())
+	for name := range alive {
+		f.state.clear(name)
+	}
+
+	for i := range candidates {
+		srv := &candidates[i]
 		if f.state.refusedFallback(srv.Name) {
 			continue
 		}

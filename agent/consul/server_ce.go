@@ -884,25 +884,6 @@ func getSerfMemberEnterpriseMeta(member serf.Member) *acl.EnterpriseMeta {
 	return structs.NodeEnterpriseMetaInDefaultPartition()
 }
 
-// validateWANBindPort rejects a WAN serf pool configured with a dynamic (0)
-// bind port. Consul creates the WAN memberlist transport itself (the mesh
-// gateway federation transport wraps it), so memberlist never gets the chance
-// to write an auto-bound port back into the config: BindPort would stay 0 and
-// the dynamic-port check in NewServer would fail there anyway.
-//
-// Running the check here, before setupSerf creates anything, means no socket
-// is ever bound just to be torn down again (and a machine with a restricted
-// ephemeral port range can't fail that bind first with an unrelated error).
-// The error still comes back through setupSerf, so NewServer takes its
-// ordinary error path: s.Shutdown() runs and releases everything registered
-// so far, including the segment RPC listeners created by setupSegmentRPC.
-func validateWANBindPort(conf *serf.Config) error {
-	if conf.MemberlistConfig.BindPort == 0 {
-		return errors.New("Failed to get dynamic bind port for WAN Serf")
-	}
-	return nil
-}
-
 func addSerfMetricsLabels(conf *serf.Config, wan bool, segment string, partition string, areaID string) {
 	conf.MetricLabels = []metrics.Label{}
 

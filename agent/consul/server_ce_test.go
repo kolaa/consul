@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/hashicorp/serf/serf"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/consul-net-rpc/go-msgpack/codec"
 	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
@@ -408,6 +410,73 @@ func TestServer_Reconcile_SkipsSegmentServerCopies(t *testing.T) {
 		"segment copies of servers must not warn on every reconcile cycle")
 }
 
+// The event path has to apply the same filter as the periodic pass above:
+// a server's copy in a segment pool fails shouldHandleMember, so queueing it
+// logged one WARN per segment per server on the leader for every flood join,
+// failure and update (review finding F9). A real client of the same segment
+// must still reach reconcileMember and be registered.
+func TestServer_LocalMemberEvent_SkipsSegmentServerCopies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	logs := &lockedBuffer{}
+	segPort := freeport.GetOne(t)
+	_, s := testServerWithDepsAndConfig(t, func(d *Deps) {
+		d.Logger = hclog.NewInterceptLogger(&hclog.LoggerOptions{
+			Output: logs,
+			Level:  hclog.Warn,
+		})
+	}, func(c *Config) {
+		c.Bootstrap = true
+		c.Segments = []NetworkSegment{segmentForTest("alpha", segPort)}
+	})
+	defer s.Shutdown()
+
+	testrpc.WaitForLeader(t, s.RPC, "dc1")
+	baseline := strings.Count(logs.String(), "skipping reconcile of node")
+
+	// A server's copy in the segment pool: must not be queued at all.
+	s.localMemberEvent(serf.MemberEvent{
+		Type: serf.EventMemberJoin,
+		Members: []serf.Member{{
+			Name:   "segment-server-copy",
+			Status: serf.StatusAlive,
+			Tags: map[string]string{
+				"role": "consul", "dc": "dc1", "segment": "alpha",
+				"id": "7d3f4a10-0000-4000-8000-000000000001", "port": "8300",
+			},
+		}},
+	})
+
+	// A real client of the same segment: must still be queued, reconciled and
+	// registered. Waiting for it in the catalog also proves the leader loop
+	// already consumed everything pushed above (reconcileCh is FIFO), so the
+	// WARN assertion below needs no sleep.
+	client := serf.Member{
+		Name:   uniqueNodeName(t.Name()) + "-web",
+		Addr:   net.ParseIP("127.0.0.1"),
+		Status: serf.StatusAlive,
+		Tags: map[string]string{
+			"role": "node", "dc": "dc1", "segment": "alpha",
+			"id": "7d3f4a10-0000-4000-8000-000000000002", "build": "1.2.3",
+		},
+	}
+	s.localMemberEvent(serf.MemberEvent{
+		Type:    serf.EventMemberJoin,
+		Members: []serf.Member{client},
+	})
+
+	retry.Run(t, func(r *retry.R) {
+		_, node, err := s.fsm.State().GetNode(client.Name, nil, "")
+		require.NoError(r, err)
+		require.NotNil(r, node, "a segment client must still be queued and registered")
+	})
+
+	require.Equal(t, baseline, strings.Count(logs.String(), "skipping reconcile of node"),
+		"a server's segment copy must not reach reconcileMember on the event path (F9)")
+}
+
 // LANSegmentAddr is a dialable join target: joinLAN hands it straight to
 // memberlist, so it must carry the segment pool's port, not just its IP.
 func TestServer_LANSegmentAddr_IncludesPort(t *testing.T) {
@@ -729,6 +798,138 @@ func TestSegmentFloodTarget(t *testing.T) {
 	srv.Addr = nil
 	_, advertised = segmentFloodTarget(srv, "alpha", 8303)
 	require.False(t, advertised, "a server without any address must not be dialed")
+}
+
+// floodServerMember builds a LAN-pool member for a server, as the segment
+// flooder sees it: role/dc/port/vsn/build is what metadata.IsConsulServer
+// needs to parse it.
+func floodServerMember(name, dc string, status serf.MemberStatus) serf.Member {
+	return serf.Member{
+		Name:   name,
+		Status: status,
+		Tags: map[string]string{
+			"role": "consul", "dc": dc, "port": "8300",
+			"vsn": "2", "build": "1.17.0",
+		},
+	}
+}
+
+// floodClientMember builds a LAN-pool member for a client node: it must never
+// become a flood candidate (the flooder only joins servers).
+func floodClientMember(name, dc string, status serf.MemberStatus) serf.Member {
+	return serf.Member{
+		Name:   name,
+		Status: status,
+		Tags: map[string]string{
+			"role": "node", "dc": dc,
+		},
+	}
+}
+
+func floodCandidateNames(candidates []metadata.Server) []string {
+	names := make([]string, 0, len(candidates))
+	for _, srv := range candidates {
+		names = append(names, srv.Name)
+	}
+	return names
+}
+
+// Candidate selection must match member names exactly: LAN pool member names
+// carry no datacenter suffix, so a node named "consul01.prod" in datacenter
+// "prod" has to compare equal to its own copy in the segment pool. Trimming
+// the ".<dc>" suffix (as the WAN flooder's naming convention invites) would
+// report it missing forever and flood-join it every pass (review F2/F13).
+func TestSegmentFloodCandidates_ExactNameMatching(t *testing.T) {
+	lan := []serf.Member{
+		floodServerMember("consul01.prod", "prod", serf.StatusAlive),
+		floodServerMember("consul02", "prod", serf.StatusAlive),
+		floodServerMember("consul03", "prod", serf.StatusFailed),
+		floodClientMember("client-1", "prod", serf.StatusAlive),
+	}
+	segment := []serf.Member{
+		floodServerMember("consul01.prod", "prod", serf.StatusAlive),
+	}
+
+	alive, candidates := segmentFloodCandidates("prod", lan, segment)
+
+	require.Contains(t, alive, "consul01.prod",
+		"the segment pool member must be recognised under its exact name")
+	require.Equal(t, []string{"consul02"}, floodCandidateNames(candidates),
+		"only the alive LAN server missing from the segment pool is a candidate")
+
+	// A client in the segment pool must not shield a server of the same name,
+	// and a failed LAN server must not be dialed at all.
+	segment = []serf.Member{
+		floodClientMember("consul02", "prod", serf.StatusAlive),
+	}
+	_, candidates = segmentFloodCandidates("prod", lan, segment)
+	require.Equal(t, []string{"consul01.prod", "consul02"}, floodCandidateNames(candidates),
+		"clients in the pool are not servers, and failed LAN members are skipped")
+}
+
+// encodedSerfTagsSize measures a tag map exactly the way serf does before it
+// hands it to memberlist: magic byte prefix, then the msgpack encoding of the
+// map (serf/serf.go encodeTags). Serf refuses anything over
+// memberlist.MetaMaxSize, so this is the byte count that matters. Map
+// iteration order changes the bytes but not their length.
+func encodedSerfTagsSize(tags map[string]string) int {
+	var buf bytes.Buffer
+	buf.WriteByte(255) // serf tagMagicByte
+	if err := codec.NewEncoder(&buf, &codec.MsgpackHandle{}).Encode(tags); err != nil {
+		panic(fmt.Sprintf("failed to encode serf tags: %s", err))
+	}
+	return buf.Len()
+}
+
+// SerfBaseTagReserve is only honest if a real server's default LAN pool tags
+// fit inside it: the config-time budget check (agent/config/segment_ce.go)
+// adds it to the datacenter name and the sl_ tags to decide whether a segment
+// list fits in serf's 512-byte tag limit. If the built-in tags ever grow past
+// the reserve, every server with many segments would be refused at config
+// time for no visible reason - or worse, serf itself would refuse to start.
+func TestServer_BaseLANTags_FitReserve(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	// A segment on a different IP from the LAN advertise address publishes an
+	// sl_<name> tag, so the test measures the tag set an operator with
+	// segments actually runs.
+	skipIfCannotBindToIP(t, "127.0.0.2")
+
+	segPort := freeport.GetOne(t)
+	seg := segmentForTest("alpha", segPort)
+	seg.Bind, seg.Advertise = "127.0.0.2", "127.0.0.2"
+	seg.SerfConfig.MemberlistConfig.BindAddr = "127.0.0.2"
+	seg.SerfConfig.MemberlistConfig.AdvertiseAddr = "127.0.0.2"
+
+	_, s := testServerWithConfig(t, func(c *Config) {
+		c.Segments = []NetworkSegment{seg}
+	})
+	defer s.Shutdown()
+
+	tags := s.serfLAN.LocalMember().Tags
+	require.Contains(t, tags, "sl_alpha",
+		"the segment tag must be published for this test to measure it")
+
+	// Everything except the sl_ tags and the datacenter name must fit the
+	// reserve the config-time check assumes.
+	base := make(map[string]string, len(tags))
+	for k, v := range tags {
+		if strings.HasPrefix(k, "sl_") || k == "dc" {
+			continue
+		}
+		base[k] = v
+	}
+	baseSize := encodedSerfTagsSize(base) - 1 // minus the magic byte
+	require.LessOrEqual(t, baseSize, SerfBaseTagReserve,
+		"default LAN pool tags (minus sl_ and dc) grew past SerfBaseTagReserve; "+
+			"raise the constant and update the config-time budget check")
+
+	// And the whole set must leave SerfTagHeadroom free below serf's limit.
+	total := encodedSerfTagsSize(tags)
+	require.LessOrEqual(t, total, SerfTagLimit-SerfTagHeadroom,
+		"a server with one segment must not eat into SerfTagHeadroom")
 }
 
 // The retry state must back failures off exponentially, skip refused
